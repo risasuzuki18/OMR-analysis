@@ -1,0 +1,1505 @@
+---
+title: "20230830_F0_screening"
+author: "Risa Suzuki"
+date: "2023-12-18"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Load libraries
+This chunk loads the packages used across the pipeline. It keeps the console quiet (suppressPackageStartupMessages), loads tidy data/plotting tools (tidyverse, ggbeeswarm, ggrepel), utilities for time-series and fast I/O (zoo, data.table), color palettes (colorspace, viridis), and parallelization backends (furrr, future). It also defines a small helper operator %!in% (“not in”) used in filters.
+
+```{r library}
+
+# =============================
+# Load required libraries
+# =============================
+
+suppressPackageStartupMessages({
+  libs <- c(
+    "tidyverse",   
+    "gridExtra",
+    "ggbeeswarm",
+    "ggrepel",
+    "ggpubr",
+    "zoo",
+    "data.table",
+    "colorspace",
+    "viridis",
+    "furrr",
+    "future",
+    "plyr",
+    "rstatix",
+    "patchwork"
+  )
+  # Load all libraries quietly
+  invisible(lapply(libs, require, character.only = TRUE))
+})
+
+# Custom infix operator: 'not in'
+`%!in%` = Negate(`%in%`)
+
+```
+
+
+# Set parameters
+This chunk centralizes user-editable settings: counts per experiment, naming for outputs, and recording specs (frame rate, spatial scale, arena radius). Edit them once here and the changes propagate through the analysis.
+```{r Setting parameters}
+
+# ============================================================
+#  Experimental and Analysis Parameters
+# ============================================================
+
+# Number of .tif files and total frames per experiment
+tiff_n <- 62
+camera_count <- 170000
+
+# Base name for output files
+name_selected_strain <- "medaka_zf"
+Name <- name_selected_strain
+
+# Camera setup and recording specs
+Single_camera <- FALSE   # TRUE if using a single camera
+#FPS <- 20.5              # Frames per second
+#Radius <- 50             # Radius from config.json (pixels)
+
+# Define experiment prefix
+Exp_prefix <- "RS_" # Prefix for experiment IDs (e.g., RS_001)
+```
+
+
+# Set source files
+This chunk sets all input/output paths: where detection files live, where time-stamp CSVs (from ImageJ Time_stamp.ijm) are stored, the metadata sheet, stripe parameters, configuration files, and the project output directory. Update these paths for your dataset; the rest of the script uses these variables.
+```{r}
+# ============================================================
+#                        Set File Paths
+# ============================================================
+
+# Main folder containing detection.csv files - keep only those that needs to be analyzed
+Path_folder <- "PATH/detection_folder"
+
+# Folder with time stamp .csv files (output from Time_stamp.ijm)
+Path_folder_3 <- "/PATH/time_stamp_folder"
+# Metadata sheet (combined experimental log)
+Path_logbook_1 <- "/PATH/metadata_sheet"
+
+# Stripe motion parameters and timing files (e.g. CvGr2_int.csv)
+Path_parameter_CvGr2 <-  "/PATH/Stripe_parameter"
+
+# Output folder to save processed data and figures
+Save_path <- "PATH/save_folder"
+
+```
+
+# Prepare File Name Lists
+
+This section collects all `*_detections.csv` files in the analysis folder  
+(e.g., `L_201_detections.csv`, `R_201_detections.csv`) and extracts experiment IDs.  
+Each experiment typically has one left (`L_`) and one right (`R_`) camera file that share the same numeric ID (e.g., `201`).  
+If only one side (`L` or `R`) is available, the experiment will still be included.
+```{r setting file names}
+
+# ============================================================
+#                 Prepare File Name Lists
+# ============================================================
+# The folder should contain files named as:
+#   L_<ExperimentID>_detections.csv
+#   R_<ExperimentID>_detections.csv
+# Example:
+#   L_201_detections.csv
+#   R_201_detections.csv
+# ============================================================
+
+# List all detection files in the folder
+file_list <- list.files(Path_folder, pattern = "_detections\\.csv$", full.names = FALSE)
+
+# Strip the suffix to get experiment base names
+Files_names_raw <- gsub("_detections\\.csv$", "", file_list)
+Files_names <- Files_names_raw
+
+# Reverse camera label for consistent ordering (e.g., L_300 → 300_L)
+Rev_Files_names <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2_\\1", Files_names)
+
+# Remove L_/R_ prefixes to get only experiment numbers
+Files <- unique(gsub("(L_)|(R_)", "", Files_names))
+
+# Generate a compact experiment range label
+File_range <- paste0(min(Files), " - ", max(Files))
+
+# Initialize vector for any experiments to be removed on error
+Remove_exp <- character(0)
+
+# Store cleaned file names for downstream use
+cleaned_files_names <- Files_names_raw
+
+```
+
+# Recalculate time for GrCV2 — overview
+	* Inputs:
+		* `Path_parameter_CvGr2` — CSV listing the known stripe start times (used to compute durations).
+		* Multiple per-stack CSVs: `RS_<ID>.csv`, `RS_<ID>_1.csv`, … in `Path_folder_3`, each with a `Mean` column.
+		* `Files` — vector of experiment IDs; `tiff_n` — number of stack parts to append.
+	* Outputs (written to `Path_folder_3`):
+		* `<ID>_timestamp_all.csv` — concatenated raw table with rolling features.
+		* `<ID>_Time_point.csv` — detected peak frames (candidate motion start/stop points).
+		* `<ID>_timestamp_full.csv` — final long table with Start/End frames, Actual_frame, and Duration.
+		* Diagnostic PNGs: `peaks.png`, `frame_diff.png`, `_MaxDiff_m100_50rows_timestamp.png`, `_mean_value_timestamp.png`, plus `interval_*` panels.
+	* Main steps:
+		* Concatenate the first `RS_<ID>.csv` and all `RS_<ID>_<i>.csv` files; tag their `video` index.
+		* Add `Frame_n` (global frame counter) and `Difference = diff(Mean)`.
+		* Compute rolling trimmed-mean (`mean_100rows`) and local dynamic range (`MaxDiff_m100_50rows`).
+		* Detect candidate motion-change frames by thresholding within pre-defined `interval` groups.
+		* Split peaks with large gaps, pick maxima per section, and save as `time_point`.
+		* Infer FPS from known 90 s segments; back-fill missing frames for blue/red/green/color-blind blocks.
+		* Build Start/End pairs (including estimated frames), compute `Actual_frame` and `Duration`.
+		* Save final CSV and interval diagnostics.
+```{r}
+
+# ================================================================
+# Recalculate time for GrCV2
+# ---------------------------------------------------------------
+# Goal:
+# 1) Combine all per-stack CSVs (tiff-stack-name.csv) for each video.
+# 2) Detect frame indices where stripe motion starts/stops, and build
+#    *_timestamp_full.csv with actual timing for analysis.
+# Assumptions from the OMR timeline:
+# - Acclimation precedes motion (in the experiment, 5 minutes).
+# - Each trial: 90 s CW → 30 s pause → 90 s CCW → 30 s pause.
+# - Color/contrast blocks separated by longer pauses.
+# Required packages: dplyr, tidyr, ggplot2, zoo (for rollapply)
+# ================================================================
+
+# Load .csv of known stripe starts, header names should match code below.
+Stripe_start_t <- read.csv(file = Path_parameter_CvGr2, na.strings = c("", "NA"))
+
+# ---------------------------------------------------------------
+# Combine tiff-stack-name.csv files with mean gray values into one .csv per experiment
+# ---------------------------------------------------------------
+for(l in 1:length(Files)){
+
+tryCatch({
+# Add the first tiff-stack-name.csv file to Time_csv_full
+Time_dir_0 <-  paste(Path_folder_3, "/RS_", Files[l],".csv", sep = "")
+Time_csv_full <- read.csv(file = Time_dir_0)
+
+# Add one row that was deleted for image calculation by duplicating the last row
+# (prevents off-by-one length issues after pairwise diff)
+Time_csv_full[nrow(Time_csv_full)+1,] <- Time_csv_full[nrow(Time_csv_full),]
+
+Time_csv_full$video <- "0" # label initial file as video 0
+
+for(i in 1:tiff_n){ 
+
+Time_dir <- paste(Path_folder_3, "/RS_", Files[l], "_", i, ".csv", sep = "")
+
+# Load .csv file 
+Time_csv <- read.csv(file = Time_dir)
+# Add one row that was deleted for image calculation by duplicating the last row
+Time_csv[nrow(Time_csv)+1,] <- Time_csv[nrow(Time_csv),]
+
+Time_csv$video <- i
+
+# Stack into a single long data.frame
+Time_csv_full <- rbind(Time_csv_full, Time_csv)
+
+}
+
+# Add proper frame number (monotonic row index over the combined table)
+Time_csv_full <- Time_csv_full %>%
+  dplyr::mutate(Frame_n = row_number())
+
+# Add column "Difference" = first difference of Mean (NA for first)
+Time_csv_full$Difference <- c(NA, diff(Time_csv_full$Mean))
+
+# Save combined raw table for reference
+Path_save_time_csv <- paste(Path_folder_3, "/", Files[l],"_timestamp_all.csv", sep = "")
+write.csv(Time_csv_full, Path_save_time_csv, row.names=TRUE)
+
+# Define a trimmed-mean function: excludes 15% extremes (7.5% each side)
+trimmed_mean <- function(x) mean(x, trim = 0.15)
+
+# Rolling features:
+# - mean_100rows: rolling trimmed mean over width=100, centered
+# - MaxDiff_m100_50rows: rolling local dynamic range (max-min) over width=101 on the smoothed series
+Time_csv_full <- Time_csv_full %>%
+  dplyr::mutate(mean_100rows = rollapply(Mean, trimmed_mean, width = 100, align = "center", fill = NA)) %>%
+  dplyr::mutate(MaxDiff_m100_50rows = rollapply(mean_100rows, width = 101,
+                                        FUN = function(x) max(x) - min (x),
+                                        align = "center", fill = NA))
+
+
+# -----------------------------------------------------------
+# Peak picking to find motion-change candidates per frame ranges
+#   - 'interval' defines frame boundaries for groups
+#   - 'threshold' defines per-group detection thresholds
+# IMPORTANT: length(threshold) must equal length(interval) - 1
+# (checked with stopifnot at the end)
+# -----------------------------------------------------------
+threshold <- c(0.015, 0.04, 0.25, 0.01, 0.4, 0.4, 0.03,    0.4,  0.025,  0.05,  0.014,    0.04)
+interval <- c(6000, 11000, 25000, 48000, 59000, 64000, 70000, 82000, 90000, 99000, 115000, 132000, 170000)
+
+# keep a copy for diagnostic plots
+Time_csv_full_ori <- Time_csv_full 
+peaks <- Time_csv_full 
+
+ # Assign each row to a group index by frame
+peaks$group <- findInterval(peaks$Frame_n, interval)
+
+# Attach the per-group threshold via case_when
+peaks <- peaks %>%
+  dplyr::mutate(threshold = case_when(
+                          group == 1 ~ threshold[1],
+                          group == 2 ~ threshold[2],
+                          group == 3 ~ threshold[3],
+                          group == 4 ~ threshold[4],
+                          group == 5 ~ threshold[5],
+                          group == 6 ~ threshold[6],
+                          group == 7 ~ threshold[7],
+                          group == 8 ~ threshold[8],
+                          group == 9 ~ threshold[9],
+                          group == 10 ~ threshold[10],
+                          group == 11 ~ threshold[11],
+                          group == 12 ~ threshold[12]))
+
+# Keep only rows above threshold (candidate motion-change zones)
+peaks <- peaks %>%
+  dplyr::filter(MaxDiff_m100_50rows > threshold)
+
+# Quick scatter to visualize detected peaks
+p <- peaks%>%
+  ggplot(aes(x = Frame_n, y = MaxDiff_m100_50rows)) +
+  geom_point(shape = ".", size = 0.1)
+
+ggsave(p, path = Path_folder_3, file = paste(Files[l], "peaks", ".png", sep = ""))
+
+# Frame-to-frame distance between picked peaks (to remove giant gaps)
+peaks$Difference <- c(NA, diff(peaks$Frame_n))
+
+# QC: threshold on gap sizes and upper frame bound (example cutoff 64k)
+p <- peaks %>%
+  dplyr::filter(Difference < 10000,
+                Frame_n < 64000) %>%
+  ggplot(aes(x= Frame_n, y = threshold)) +
+  geom_point(size = 0.1)   
+
+# Show raw differences and a guide-line at 400 (used to split blocks)
+p <- peaks %>%
+#  dplyr::filter(Difference < 10000) %>%
+  ggplot(aes(x= Frame_n, y = Difference)) +
+  geom_point(size = 0.1) +
+  geom_hline(yintercept = 400) 
+
+ggsave(p, path = Path_folder_3, file = paste(Files[l], "frame_diff", ".png", sep = ""))
+
+# Keep only "true" separators (large diff)
+Filter <- peaks %>%
+  dplyr::filter(Difference > 400)
+
+# Split peaks into consecutive sections by those separators
+peaks$peaks <- findInterval(peaks$Frame_n, Filter$Frame_n)
+
+# Within each section, take the row with maximum MaxDiff_m100_50rows
+Max <- peaks %>%
+  dplyr::group_by(peaks) %>%
+  slice(which.max(MaxDiff_m100_50rows))
+
+# Mark the chosen peak frame numbers as "time_point"
+peaks <- peaks %>%
+  dplyr::mutate(time_point = case_when(Frame_n %in% Max$Frame_n ~ Frame_n))
+
+# Reduce to distinct time points and save
+Time_point <- peaks %>%
+  dplyr::select(time_point) %>%
+  distinct()
+
+Path_save_time_csv <- paste(Path_folder_3, "/", Files[l],"_Time_point.csv", sep = "")
+write.csv(Time_point, Path_save_time_csv, row.names=TRUE)
+
+# -----------------------------------------------------------
+# Estimate missing time frames using FPS inferred from known 90 s segments
+# NOTE: These indices (30,41,48,63,64,66...) assume a fixed count/order.
+# If peak counts shift, these may index wrong rows (potential source of errors).
+# -----------------------------------------------------------
+    
+FPS_b <- (Time_point[31,] - Time_point[30,])/90
+FPS_r <- (Time_point[42,] - Time_point[41,])/90
+FPS_g <- (Time_point[49,] - Time_point[48,])/90
+FPS_color <- (Time_point[64,] - Time_point[63,])/90
+
+# Blue block estimates (backfill relative to anchor rows)
+Est_frame_blue <- round(c(Time_point[30,] - 240 * FPS_b,
+                          Time_point[30,] - 150 * FPS_b,
+                          Time_point[30,] - 120 * FPS_b,
+                          Time_point[30,] - 30 * FPS_b,
+                          Time_point[33,] - 30 * FPS_b
+                          ))
+# Red block estimates
+Est_frame_red <- round(c(Time_point[41,] - 480 * FPS_r,
+                         Time_point[41,] - 390 * FPS_r,
+                         Time_point[41,] - 360 * FPS_r,
+                         Time_point[41,] - 270 * FPS_r,
+                         Time_point[41,] - 240 * FPS_r,
+                         Time_point[41,] - 150 * FPS_r,
+                         Time_point[41,] - 120 * FPS_r,
+                         Time_point[41,] - 30 * FPS_r,
+                         Time_point[44,] - 30 * FPS_r
+                         ))
+# Green block estimates
+Est_frame_green <- round(c(Time_point[48,] - 240 * FPS_g,
+                           Time_point[48,] - 150 * FPS_g,
+                           Time_point[48,] - 120 * FPS_g,
+                           Time_point[48,] - 30 * FPS_g,
+                           Time_point[51,] - 30 * FPS_g))
+# color_blind block estimate
+Est_frame_color <- round(c(Time_point[66,] - 30 * FPS_color))
+
+# Combine all estimated frames, then duplicate each as (x, x+1) to create Start/End pairs
+Est_frame <- c(Est_frame_blue, 
+               Est_frame_red,
+               Est_frame_green,
+               Est_frame_color)
+
+Est_frame <- as.vector(sapply(Est_frame,
+                              function(x) c(x, x + 1)))
+
+# -----------------------------------------------------------
+# Diagnostics: overlay detected/estimated lines on summary plots
+# -----------------------------------------------------------
+p <- peaks %>%
+  ggplot(aes(x = Frame_n, y = MaxDiff_m100_50rows)) +
+  geom_point(size = 0.1)+
+  geom_vline(xintercept = c(peaks$time_point), color = "gray") +
+    geom_vline(xintercept = Time_point[30,], color = "blue") +
+    geom_vline(xintercept = Time_point[41,], color = "red") +
+      geom_vline(xintercept = Time_point[48,], color = "green") +
+    geom_vline(xintercept = Est_frame_blue, color = "blue", alpha = 0.2) +
+     geom_vline(xintercept = Est_frame_red, color = "red", alpha = 0.2) +
+     geom_vline(xintercept = Est_frame_green, color = "green", alpha = 0.2) +
+     geom_vline(xintercept = Est_frame_color, color = "yellow", alpha = 0.2)
+ggsave(p, path = Path_folder_3, file = paste(Files[l], "_MaxDiff_m100_50rows_timestamp", ".png", sep = ""))
+
+p <- Time_csv_full %>%
+  ggplot(aes(x = Frame_n, y = Mean)) +
+  geom_point(size = 0.1)+
+  geom_vline(xintercept = c(peaks$time_point,
+                            Est_frame_blue,
+                            Est_frame_red,
+                            Est_frame_green,
+                            Est_frame_color),
+                            color = "red")+
+  geom_vline(xintercept = 110000, color = "black") +
+  ylim(0,5)
+
+ggsave(p, path = Path_folder_3, file = paste(Files[l], "_mean_value_timestamp", ".png", sep = ""))
+# ---------------------------------------------------------------
+# Keep only the first frame, each detected start frame, and the preceding frame
+# (i.e., 1, t, t-1 for each peak t) to build start/end pairs later
+# ---------------------------------------------------------------
+Time_csv_full <- Time_csv_full %>%
+  dplyr::filter(Frame_n %in% c(1, peaks$time_point, peaks$time_point - 1))
+
+# Remove the last row of Time_csv_full (often an extra duplicated tail row)
+Time_csv_full <- Time_csv_full[-nrow(Time_csv_full),] 
+
+# Create mock rows from estimated frames; they will be merged and sorted by Frame_n
+mock_rows <- data.frame(
+  X = NA,
+  Mean = NA,
+  video = NA,
+  Frame_n = Est_frame,
+  Difference = NA,
+  mean_100rows = NA,
+  MaxDiff_m100_50rows = NA
+)
+
+# Combine and order by frames
+Time_csv_full <- rbind(Time_csv_full, mock_rows)
+
+# Order the combined Time_csv_full by the Frame_n column
+Time_csv_full <- Time_csv_full[order(Time_csv_full$Frame_n), ]
+
+# Label alternating rows as Start_f/End_f (expects exactly 108 pairs = 216 rows)
+Time_point <- rep(c("Start_f", "End_f"), 108)
+Time_csv_full$Time_point <- Time_point
+
+# Wide format with Start_f and End_f columns
+Time_csv_full <- Time_csv_full %>%
+  select(Time_point, Frame_n) %>%
+  group_by(Time_point) %>%
+  dplyr::mutate(row = row_number()) %>% # Need this to make pivot_wider work
+  tidyr::pivot_wider(names_from = Time_point,
+              values_from = Frame_n)
+
+# Actual_frame = number of frames during stripe motion
+Time_csv_full <- Time_csv_full %>%
+  dplyr::mutate(Actual_frame = End_f - Start_f)
+
+# QC scatter of Actual_frame per event index
+t <- Time_csv_full %>%
+  ggplot(aes(x = row, y = Actual_frame)) +
+  geom_point(size = 0.1)
+
+ggsave(t, path = Path_folder_3, file = paste(Files[l], "_actual_frames", ".png", sep = ""))
+
+# Add Duration column (in seconds) from known stripe starts
+Duration <- c(300, diff(Stripe_start_t$Start_s)[3:109])
+Time_csv_full$Duration <- Duration
+
+# Save the final *_timestamp_full.csv
+Path_save_time_csv <- paste(Path_folder_3, "/", Files[l],"_timestamp_full.csv", sep = "")
+write.csv(Time_csv_full, Path_save_time_csv, row.names=TRUE)
+
+# ---------------------------------------------------------------
+# Interval diagnostics (with vertical lines at End_f inside each interval)
+# ---------------------------------------------------------------
+stopifnot(length(threshold) == length(interval) - 1)
+
+# Helper to build a single plot for interval i
+make_interval_plot <- function(i) {
+  x_min <- interval[i]
+  x_max <- interval[i + 1]
+  thr   <- threshold[i]
+  
+  # pick only End_t values inside this interval
+  vlines <- Time_csv_full %>%
+    dplyr::filter(End_f >= x_min, End_f <= x_max) %>%
+    pull(End_f)
+
+  ggplot(
+    Time_csv_full_ori %>% filter(Frame_n >= x_min, Frame_n <= x_max),
+    aes(x = Frame_n, y = MaxDiff_m100_50rows)
+  ) +
+    geom_point(size = 0.1) +
+    geom_hline(yintercept = thr, linewidth = 0.4, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = vlines, color = "blue", linewidth = 0.3) +
+    labs(
+      title = paste0("Interval ", i, ": Frames ", x_min, "–", x_max),
+      subtitle = paste0("Threshold = ", thr),
+      x = "Frame_n",
+      y = "MaxDiff_m100_50rows"
+    ) +
+    theme_bw(base_size = 11)
+}
+
+# 1) Create and save 12 PNGs (one per threshold interval)
+for (i in seq_len(length(threshold))) {
+  p <- make_interval_plot(i)
+  ggsave(
+    filename = paste0("interval_",Files[l],"_", i, "_", interval[i], "-", interval[i + 1], ".png"),
+    plot = p,
+    path = Path_folder_3,
+    width = 7, height = 4, dpi = 200
+  )
+}
+
+}, error = function(e) {
+  message("An error occurred: ", e$message)
+stopifnot(length(threshold) == length(interval) - 1)
+
+# Helper to build a single plot for interval i
+make_interval_plot <- function(i) {
+  x_min <- interval[i]
+  x_max <- interval[i + 1]
+  thr   <- threshold[i]
+  
+  ggplot(
+    Time_csv_full_ori %>% filter(Frame_n >= x_min, Frame_n <= x_max),
+    aes(x = Frame_n, y = MaxDiff_m100_50rows)
+  ) +
+    geom_point(size = 0.1) +
+    geom_hline(yintercept = thr, linewidth = 0.4, linetype = "dashed", color = "red") +
+    labs(
+      title = paste0("Interval ", i, ": Frames ", x_min, "–", x_max),
+      subtitle = paste0("Threshold = ", thr),
+      x = "Frame_n",
+      y = "MaxDiff_m100_50rows"
+    ) +
+    theme_bw(base_size = 11)
+}
+
+# 1) Create and save 12 PNGs
+for (i in seq_len(length(threshold))) {
+  p <- make_interval_plot(i)
+  ggsave(
+    filename = paste0("interval_",Files[l],"_", i, "_", interval[i], "-", interval[i + 1], ".png"),
+    plot = p,
+    path = Path_folder_3,
+    width = 7, height = 4, dpi = 200
+  )
+}
+  Remove_exp <<- paste0(c(Remove_exp, Files[l]), collapse = "|")
+  print(e)
+})
+
+
+}
+
+```
+
+# Redefine the experiment files
+This step excludes experiments that failed earlier (collected in `Remove_exp`) and rebuilds the working file lists.  
+Specifically, it:
+1) finds indices of filenames matching any pattern in `Remove_exp`,  
+2) removes those experiments from `Files_names_raw`,  
+3) rebuilds `Files_names`, `Rev_Files_names`, and the numeric `Files` list for downstream loops.  
+If `Remove_exp` is empty, nothing is changed.
+```{r}
+# ============================================================
+#          Exclude failed experiments and rebuild lists
+# ============================================================
+# If 'Remove_exp' contains any experiment IDs/patterns recorded
+# during the timing step, remove them from the active file lists
+# and re-derive 'Files_names', 'Rev_Files_names', and 'Files'.
+if(length(Remove_exp) != 0){
+  
+# Display the experiment IDs (or patterns) flagged for removal.
+Remove_exp
+
+# Find the indices in 'Files_names_raw' that match any of the entries
+# in 'Remove_exp'. This identifies which experiment files to exclude.
+Which_to_remove <- grep(Remove_exp, Files_names_raw)
+
+# Remove the flagged experiments from the full file list.
+# This produces a cleaned list containing only successfully processed experiments.
+cleaned_files_names <- Files_names_raw[-Which_to_remove]  
+
+# Redefine the main filename list ('Files_names') to use only the cleaned set.
+Files_names <- cleaned_files_names
+
+# Reverse the order of "L_" / "R_" prefixes and numeric experiment IDs
+# (e.g., "L_203" → "203_L") for consistent downstream processing.
+Rev_Files_names <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2_\\1", Files_names)
+
+# Extract only the numeric experiment IDs from the filenames
+# (e.g., "L_203" and "R_203" both become "203").
+Files <- unique(gsub( "(L_)|(R_)","",Files_names))
+}
+
+```
+
+# Calculate lag of camera
+```{r Calculate lag of camera}
+# ============================================================
+#                 Calculating lag of camera (FPS)
+# ============================================================
+# For each experiment, compute observed FPS = (frames in motion interval) / (interval duration, s),
+# then plot FPS over cumulative experimental time to check for drift/lag.
+
+Time_csv_full <- NULL
+
+for(l in 1:length(Files)){
+
+# Read the per-experiment timing table produced earlier
+Time_dir <- paste(Path_folder_3, "/", Files[l], "_timestamp_full.csv", sep = "")
+Time_csv <- read.csv(file = Time_dir)
+
+# Compute FPS for each phase and tag with experiment ID
+#   Actual_frame: number of frames between Start_f and End_f
+Time_csv <- Time_csv %>%
+  dplyr::mutate(fps = Actual_frame/Duration,
+         Exp_n = Files[l],)
+
+# Accumulate all experiments
+Time_csv_full <- rbind(Time_csv_full, Time_csv)
+
+}
+
+# Build cumulative experimental time (in seconds) per experiment
+Time_csv_full <- Time_csv_full %>%
+  dplyr::group_by(Exp_n) %>%
+  dplyr::mutate(Time = cumsum(Duration))
+
+# --------------------------------------------------------------------
+# Plot FPS over time for each experiment
+# --------------------------------------------------------------------
+p <- Time_csv_full %>%
+  dplyr::group_by(Exp_n) %>%
+  ggplot(aes(x = Time, y = fps, color = Exp_n)) +
+  geom_smooth() +
+  geom_point() 
+  
+ggsave(p, path = Path_folder_3, file = paste("FPS", ".png", sep = ""))
+
+```
+
+# Load metadata sheet
+Modify the meta datasheet 
+  * set class of "Exp_date, Eggs_collected and Hatched" columns as "Date"
+  * add columns for "dph" and "dpf" 
+  * separate "Strain" column to "Strain", "Generation", "StockID" by "_"
+  * filter those rows with "0-49" as values for "Position" column
+```{r Load metadatasheet}
+# ============================================================
+#                    Load & Modify Metadata
+# ============================================================
+# Goal:
+#  - Load the experimental metadata sheet
+#  - Fix known entry typos
+#  - Parse date columns
+#  - Derive dpf/dph (days post fertilization / hatching)
+#  - Split Strain into Strain/Generation/StockID
+#  - Keep only wells/positions 0–49 for analysis
+
+# Load metadata sheet as .csv file; treat "" and "NA" as missing
+row_metadata <- read.csv(file = Path_logbook_1, na.strings = c("", "NA"))
+
+# ------------------------------------------------------------
+# Parse date-like columns as Date (YYYYMMDD → Date)
+# ------------------------------------------------------------
+row_metadata$Exp_date       <- as.Date(as.character(row_metadata$Exp_date),       "%Y%m%d")
+row_metadata$Eggs_collected <- as.Date(as.character(row_metadata$Eggs_collected), "%Y%m%d")
+row_metadata$Hatched        <- as.Date(as.character(row_metadata$Hatched),        "%Y%m%d")
+
+# ------------------------------------------------------------
+# Derive dpf/dph, split Strain, and filter valid positions
+# ------------------------------------------------------------
+clean_metadata <- row_metadata %>%
+ dplyr::mutate(dpf = as.numeric(difftime(row_metadata$Exp_date, row_metadata$Eggs_collected, units = "days"))) %>%
+ dplyr::mutate(dph = as.numeric(difftime(row_metadata$Exp_date, row_metadata$Hatched, units = "days"))) %>%
+  separate(Strain, c("Strain", "Generation", "StockID"), sep = "_") %>%
+  dplyr::filter(Position %in% as.character(c(0:49)))
+
+```
+
+
+# Quick checks on the metadata sheet:
+- Print unique values for a visual scan.
+- Flag `Exp_ID` with **dpf** outside **5–20 days** (verify `Exp_date` vs. `Eggs_collected`).
+- Flag `Exp_ID` with **dph** outside **0–20 days** (verify `Exp_date` vs. `Hatched`).
+- Optionally warn if `Eggs_collected` or `Hatched` occurs **after** `Exp_date`.
+
+```{r check metadata sheet}
+# ============================================================
+#           Quick check for metadata consistency
+# ============================================================
+
+# Show unique values for a quick visual check
+unique_data <- as.list(lapply(clean_metadata, unique))
+print(unique_data)
+
+# ---- Check ranges for dpf (5–20) and dph (0–20) ----
+bad_dpf <- clean_metadata %>%
+  dplyr::filter(!is.na(dpf) & !(dpf %in% 5:20))
+
+bad_dph <- clean_metadata %>%
+  dplyr::filter(!is.na(dph) & !(dph %in% 0:20))
+
+# ---- Print alerts if issues are found ----
+if (nrow(bad_dpf) > 0) {
+  warning(paste0("⚠️  dpf out of expected range (5–20 days): ",
+                 paste(unique(bad_dpf$Exp_ID), collapse = ", ")))
+}
+
+if (nrow(bad_dph) > 0) {
+  warning(paste0("⚠️  dph out of expected range (0–20 days): ",
+                 paste(unique(bad_dph$Exp_ID), collapse = ", ")))
+}
+
+# ---- Optional: flag impossible date orders ----
+bad_dates <- clean_metadata %>%
+  dplyr::filter(Eggs_collected > Exp_date | Hatched > Exp_date)
+
+if (nrow(bad_dates) > 0) {
+  warning(paste0("⚠️  Date inconsistency (Eggs_collected/Hatched after Exp_date): ",
+                 paste(unique(bad_dates$Exp_ID), collapse = ", ")))
+}
+
+# Print message if all looks good
+if (nrow(bad_dpf) == 0 && nrow(bad_dph) == 0 && nrow(bad_dates) == 0) {
+  message("✅ Metadata check passed — all values within expected ranges.")
+}
+```
+
+# Calculate response value
+	* Purpose: Loop through detection files (`<L|R>_<id>_detections.csv`) and compute per-fish response metrics.
+	* Process:
+		* Extract experiment number (`Exp_n`) and camera side (`L`/`R` or `single`).
+		* Run `calculate_response_values.Rmd` to calculate responses (`final_df_m`, `Speed`, `Diff_angle`).
+		* Save results as `results_<Exp_n>_<L|R>.csv` in `Save_path`.
+```{r Calculate response value}
+
+# Extract just the numeric part of "<L|R>_<id>"
+Files_2 <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2", Files_names)
+
+# Loop over all detection files
+for(i in 1:length(Files_names)){
+# Path to the detection.csv for this camera side & experiment
+Path_detection_file <- paste(Path_folder, "/", Files_names[i], "_detections.csv", sep = "")
+
+# Extract experiment number and position of camera (Left or Right)
+Exp_n <- gsub("[RL_]", "", Files_names[i]) #Extract R, L or _ in the File_name[i]
+
+# Camera side label ("single" if Single_camera == TRUE)
+if (Single_camera == TRUE) {
+  L_R <- "single"}
+else {
+L_R <- str_sub(Files_names[i], 1,1)} # 'L' or 'R'
+
+# Numeric experiment id
+File_n <- Files_2[i] 
+
+# ------------------------------------------------------------
+# Run the analysis notebook that computes response metrics
+# ------------------------------------------------------------
+rmarkdown::render("calculate_response_values.Rmd")
+
+# ------------------------------------------------------------
+# Save outputs produced by the Rmd:
+#   - final_df_m   : responses per animal/well
+#   - Speed        : speed summaries
+#   - Diff_angle   : per-frame angle differences
+# ------------------------------------------------------------
+
+# Responses
+csv_name <- paste("results", Exp_n, metadata_csv_clean$L_R[1], sep = "_") 
+Path_save_csv <- paste(Save_path, "/", csv_name, ".csv", sep = "")
+write.csv(final_df_m, Path_save_csv, row.names=TRUE)
+
+}
+
+```
+
+# Rename csv files
+```{r Rename csv files}
+# ============================================================
+#            Rename files for single-camera runs
+# ============================================================
+# If Single_camera == TRUE, remove the "_single" suffix from
+# all CSV filenames in Save_path for consistency.
+if (Single_camera == TRUE){
+# Get a list of all CSV files in the folder
+csv_files <- list.files(path = Save_path, pattern = "\\.csv$", full.names = TRUE)
+
+ # Rename each by stripping "_single"
+for (file in csv_files) {
+  new_name <- gsub("_single", "", basename(file))  # Remove "_single"
+  new_path <- file.path(Save_path, new_name)  # Create the new file path
+  
+# Rename the file
+  file.rename(file, new_path)
+  
+  print(paste("Renamed:", basename(file), "→", new_name))
+}
+}
+
+```
+
+# Combinine post-analysis CSVs into full tables
+```{r Combinine post-analysis CSVs into full tables}
+
+# ============================================================
+#      Combine post-analysis CSV outputs into summaries
+# ============================================================
+# Build consolidated tables:
+#   - results_full.csv         (stack of 'results_<id>_<side>.csv')
+#   - results_speed_full.csv   (stack of 'results_speed_<id>_<side>.csv')
+# After writing each combined file, delete the corresponding
+# individual post-analysis CSVs to keep the folder tidy.
+
+# Normalize "<L|R>_<id>" → "<id>_<L|R>" for consistent filenames
+Files_names <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2_\\1", Files_names)
+
+
+# ------------------------------------------------------------
+# Combine all results_<id>_<side>.csv files
+# ------------------------------------------------------------
+results_full<- NULL
+
+for(i in 1:length(Files_names)){
+Path_results <- paste(Save_path, "/results_", Files_names[i], ".csv", sep = "")
+result_csv <- read.csv(file = Path_results, na.strings = c("", "NA"))
+results_full <- rbind(results_full, result_csv)
+}
+
+Path_save_csv <- paste(Save_path, "/results_full.csv", sep = "")
+write.csv(results_full, Path_save_csv, row.names=TRUE)
+
+# ------------------------------------------------------------
+# Delete the individual results_<id>_<L|R>.csv files
+# ------------------------------------------------------------
+Path_results_files <- NULL
+for(i in 1:length(Files_names)){
+Path_results <- paste(Save_path, "/results_", Files_names[i], ".csv", sep = "")
+Path_results_files <- c(Path_results_files , Path_results)
+}
+
+# Check if Path_save_csv exists
+if (file.exists(Path_save_csv)) {
+file.remove(Path_results_files)
+} else {
+  cat("Path_save_csv does not exist, no files will be deleted.\n")
+}
+
+```
+
+# Load results_full
+```{r Load results_full}
+
+# Load combined .csv file 
+Path_save_csv <- paste(Save_path, "/results_full.csv", sep = "")
+results_full <- read.csv(file = Path_save_csv, na.strings = c("", "NA"))
+
+```
+
+# Exclude samples with low detection rate
+```{r}
+
+results_full <- results_full %>%
+  dplyr::filter(Det_rate > 75)
+
+```
+
+
+# Group by start time & add metadata — overview
+	* Purpose: Filter valid rows, bucket experiments by start-hour, and add ID/helper columns for plotting.
+	* Process:
+		* Drop rows with missing `Det_rate`.
+		* Derive `Time_gr` from the first 2 chars of `Record_start` (hour bins).
+		* Create composite IDs: `st_dph`, `Exp_ID_pos`, `pos_st_dph`, `Strain_expid_pos`.
+		* Build color-pair label `str_cols` and set its factor order (reverse of first appearance).
+```{r Group by the time of starting of experiment}
+
+# ============================================================
+#        Group by experiment start time and add metadata
+# ============================================================
+
+# Remove rows without detection rate data
+results_full  <- results_full %>%
+  dplyr::filter(!is.na(Det_rate)) 
+
+# Extract hour information from "Record_start"
+# (Keep only the first two characters to group by hour)
+results_full$Record_start <- str_sub(results_full$Record_start, 1, 2) 
+
+# Create time-group labels (e.g., "09:00–10:59") based on start time
+# Also add:
+#   - st_dph: combined Strain and developmental stage (e.g., "HdrR_5dph")
+#   - Exp_ID_pos: combined experiment ID and position
+results_full <- results_full %>%
+ dplyr::mutate(
+   Time_gr = case_when(
+   Record_start %in% c("9:", "10") ~ "09:00-10:59", 
+   Record_start %in% c("11", "12") ~ "11:00-12:59",
+   Record_start %in% c("13", "14") ~ "13:00-14:59",
+   Record_start %in% c("17", "18") ~ "17:00-18:59",
+   Record_start %in% c("15", "16") ~ "15:00-16:59",
+   Record_start %in% c("19", "20", "21") ~ "19:00-21:59"),
+   st_dph = paste(Strain, dph, "dph", sep = "_"),
+   Exp_ID_pos = paste(Exp_ID, Position, sep = "_") ###
+  )
+
+# ============================================================
+#                 Add columns to results_full
+# ============================================================
+
+# Keep only the leaf name of Strain (remove any path prefix)
+results_full$Strain <- gsub("/.*", "", results_full$Strain)
+
+# Add composite columns:
+# - pos_st_dph: Position + Strain + dph (e.g., "A1_HdrR_5dph")
+# - str_cols:   concatenated color pair (e.g., "#FFFFFF_#000000")
+# - Strain_expid_pos: Strain + Exp_ID_pos (e.g., "HdrR_EXP123_A1")
+results_full <- results_full %>%
+  dplyr::filter(Strain %!in% c(NaN, NA)) %>%  
+  dplyr::mutate(pos_st_dph = paste(Position, Strain, dph, "dph", sep = "_"),
+                str_cols   = paste(Col_1, Col_2, sep = "_"),
+                Strain_expid_pos = paste(Strain, Exp_ID_pos, sep = "_"))
+
+# Set factor levels for str_cols to control plotting order (reverse of first-appearance order)
+str_cols_lv <- unique(results_full$str_cols)
+results_full$str_cols <- factor(results_full$str_cols, levels = rev(str_cols_lv))
+
+```
+
+# Categorize responses & compute thresholds — overview
+	* Purpose: For each fish × color pair, decide if it responded (both directions) or swam in one direction, then add color-group/contrast indices.
+	* Process:
+  - For each (`Exp_ID`, `Position`, `str_width_dir`) compute counts:
+    - `count_pass_p`: frames with `Response_value ≥ +0.5` (swimming with stripe),
+    - `count_pass_n`: frames with `Response_value ≤ –0.5` (swimming against stripe),
+    - `count_paused`: frames with `–0.3 < Response_value < +0.3`. (not swimming)
+		* Define flags:
+			* Responded: CW & CCW both > 9 in the same sign.
+			* One_direction: opposite signs with stricter counts (> 12 each).
+		* Map color pairs to groups (Gray, Blue, Red, Green, Others) and ordinal Contrast (1..N).
+		* Join flags/groups back to `results_full`; mark `Exclude` when the next entry is one-direction.
+		* Extract responding “Others” color pairs for downstream use.
+	* Outputs: Updated `results_full` with `Responded`, `One_direction`, `Color_group`, `Contrast`, `Exclude`; plus `Color_stripes` (responding “Others” only).
+```{r}
+
+# ============================================================
+#   Categorize each fish's response and compute threshold
+# ============================================================
+# Idea:
+# - For each fish (Strain × Exp_ID × Position) and each color pair (str_cols),
+#   # - Count per-bin responses (≥ +0.5, ≤ −0.5, paused), then
+# - Then summarize per fish & color pair whether it "Responded" in both directions
+#   or showed a "One_direction" pattern (CW positive with CCW negative, or vice versa).
+# - Build color/contrast grouping and ordinal indices for contrast within each color set.
+# - Create an "Exclude" flag for sequences where a one-direction response appears.
+# - Finally, extract the color-blind ("Others") subset that responded.
+
+# ------------------------------------------------------------
+# Build per-phase counts:
+#  - count_pass_p : bins with Response_value ≥ +0.5 (with stripe)
+#  - count_pass_n : bins with Response_value ≤ −0.5 (against stripe)
+#  - count_paused : bins with −0.3 < Response_value < +0.3 (paused)
+# Add helper IDs for later joins.
+# ------------------------------------------------------------
+Threshold <- results_full %>%
+  dplyr::select(Direction:Speed_deg.s, End_s, Position:StockID, Exp_ID:Stripe_parameter, Dish:str_cols) %>%
+  dplyr::group_by(Strain, Exp_ID, Position, Direction, str_cols) %>%
+  dplyr::mutate(
+  # Counts of response states within this group
+    count_pass_p = sum(Response_value >= 0.5),
+    count_pass_n = sum(Response_value <= -0.5),
+    count_paused = sum(Response_value < 0.3 & Response_value > -0.3),
+    Strain_expid_pos = paste(Strain, Exp_ID, Position, sep ="_")
+  )
+
+# --- Collapse to one row per fish × color pair; decide Responded / One_direction
+Threshold <- Threshold %>%
+  distinct() %>%
+  ungroup() %>%
+  dplyr::group_by(Strain_expid_pos, str_cols, Exp_ID) %>%
+  dplyr::summarize(
+    # "Responded": both directions show sufficient consistent turns in the SAME sign
+    # (either both CW & CCW positive counts exceed 9, or both negative exceed 9)
+    Responded = if_else(
+      (!is.na(count_pass_p[Direction == "CW"]) & count_pass_p[Direction == "CW"] > 9 &
+      !is.na(count_pass_p[Direction == "CCW"]) & count_pass_p[Direction == "CCW"] > 9 ) |
+      (!is.na(count_pass_n[Direction == "CW"]) & count_pass_n[Direction == "CW"] > 9 &
+      !is.na(count_pass_n[Direction == "CCW"]) & count_pass_n[Direction == "CCW"] > 9 ),
+      first(str_cols, na.rm = TRUE),  # keep the color pair label when true
+      factor(NA, levels = levels(str_cols))), # otherwise NA (preserve factor levels)
+    # "One_direction": opposite-sign pattern with stronger thresholds (>12 each)
+    # (CW positive & CCW negative, or CW negative & CCW positive)
+        One_direction = if_else(
+      (count_pass_p[Direction == "CW"] > 12 &
+      count_pass_n[Direction == "CCW"] > 12) |
+      (count_pass_n[Direction == "CW"] > 12 &
+      count_pass_p[Direction == "CCW"] > 12) ,
+      first(str_cols), 
+      factor(NA, levels = levels(str_cols))
+  ))
+
+# --- Map each color pair to an integer position (appearance order) -------------
+color_codes <- unique(results_full$str_cols)
+results_full$Color_Position <- match(results_full$str_cols, color_codes)
+
+# --- Build color/contrast groupings -------------------------------------------
+# Assign each color pair to a color group and give it a within-group ordinal "Contrast"
+# (Gray_contrast: 1–7, Blue: 1–4, Red: 1–4, Green: 1–4, Others: 1–8)
+Contrast <- results_full %>%
+  distinct() %>%
+  dplyr::mutate(Color_group = case_when(
+    Color_Position %in% c(2:8) ~ "Gray_contrast",
+    Color_Position %in% c(9:12) ~ "Blue",
+    Color_Position %in% c(13:16) ~ "Red",
+    Color_Position %in% c(17:20) ~ "Green",
+    Color_Position %in% c(21:28) ~ "Others"
+  )) %>%
+ dplyr::select(str_cols, Color_group) %>%
+  distinct() %>%
+ dplyr::group_by(Color_group) %>%
+  dplyr::mutate(
+    Contrast = case_when(
+      Color_group == "Gray_contrast" ~ row_number(),      # Counts from 1 to 7
+      Color_group == "Blue" ~ row_number(),               # Counts from 1 to 4
+      Color_group == "Red" ~ row_number(),                # Counts from 1 to 4
+      Color_group == "Green" ~ row_number(),              # Counts from 1 to 4
+      Color_group == "Others" ~ row_number()              # Counts from 1 to 8 in this case
+    )) %>%
+  ungroup()
+
+# --- Join flags/groups back to the full data; convert to logical indicators ----
+results_full <- results_full %>%
+  distinct() %>%
+  full_join(Threshold) %>%
+  dplyr::mutate(One_direction = if_else(!is.na(One_direction), TRUE, NA)) %>%
+  full_join(Contrast) %>%
+    dplyr::mutate(Responded = if_else(!is.na(Responded), TRUE, NA)) 
+
+# --- Mark sequences to exclude if the NEXT entry shows one-direction behavior --
+# For each experiment/position within a color group, set Exclude = TRUE
+# when the next row (lead) has One_direction == TRUE.
+Exclude <- results_full %>%
+  select(Exp_ID_pos, str_cols, One_direction, Contrast, Color_group) %>%
+  distinct() %>%
+  dplyr::group_by(Exp_ID_pos, Color_group) %>%
+  dplyr::mutate(
+    Exclude = ifelse(
+      lead(One_direction) == TRUE,
+      TRUE,
+      FALSE
+    )
+  )
+
+# Attach Exclude flag back to results_full
+results_full <- results_full %>%
+  full_join(Exclude)
+
+# --- Extract responding COLOR-BLIND combinations (“Others”) color pairs --------------------
+# Keep only rows that:
+#   - belong to the "Others" group (human color-blind set),
+#   - have Responded == TRUE,
+#   - and drop helper columns used only for gating.
+Color_stripes <- results_full %>%
+  dplyr::select(Strain, Time_gr:Exclude) %>%
+  dplyr::filter(Responded == TRUE,
+                Color_group == "Others") %>%
+  distinct() %>%
+  dplyr::group_by(Exp_ID_pos, Color_group) %>%
+  dplyr::select(-c(
+                   Exclude,
+                   Contrast,
+                   Color_Position,
+                   One_direction
+)) %>%
+  distinct()
+
+```
+
+# Plot 
+	* Build per-fish Threshold (min contrast when Responded==TRUE); add non-responders as Threshold=8; combine.
+	* Subsample ≤25 fish/strain for fair visuals; save sampled IDs and sample-size tables.
+	* Map Threshold → luminance difference (%) per Color_group (Gray, Blue, Red, Green; skip “Others” here).
+	* Plot:
+		* Histogram of counts by luminance_diff (facet: Strain × Color_group).
+		* Ratio barplot (% at each luminance_diff).
+		* Ratio barplot by Threshold index (1–7; 8 = non-responder).
+		* “Others” (iso-luminant) barplot: % responded per color pair, with totals.
+		* Boxplots (per Color_group) + beeswarm, stats (Kruskal–Dunn), and responder/non-responder annotations.
+	* Requires: dplyr, ggplot2, rstatix, ggbeeswarm, ggpubr (for stat_pvalue_manual), tidyr.
+	* Notes: -25 encodes non-responders; adjust bin widths/label positions if axes change.
+```{r}
+# ============================================================
+#                         Plot
+# ------------------------------------------------------------
+# Workflow:
+# 1) Build a per-fish threshold table (minimum contrast at which the fish responded).
+# 2) Build a complementary table for non-responders (Responded == NA) and set Threshold=8.
+# 3) Combine both into a single table used for histograms and ratios.
+# 4) Subsample up to 25 fish per strain (for fair visualization).
+# 5) Map Threshold to luminance differences (%) per Color_group.
+# 6) Plot:
+#    - counts histogram of luminance_diff (per strain x color group),
+#    - ratio barplot of luminance_diff (per strain x color group),
+#    - ratio barplot by Threshold (leveled bins),
+#    - “Others” group (iso-luminant) response ratios per color pair.
+#    - boxplots with overlayed responder/non-responder summary text.
+# Requirements:
+#   dplyr, ggplot2, rstatix (shapiro_test, kruskal_test, dunn_test),
+#   ggbeeswarm (geom_beeswarm), ggpubr (stat_pvalue_manual) if used,
+#   tidyr for joins used downstream.
+# ============================================================
+
+# --- Build threshold table for responders -------------------------------------
+# Keep only columns needed → filter Responded==TRUE → one min-contrast Threshold per fish x color group
+Threshold <- results_full %>%
+  dplyr::select(Strain, Exp_ID, Time_gr:Exclude) %>%
+  dplyr::filter(Responded == TRUE 
+                ) %>%
+  distinct() %>%
+  dplyr::group_by(Exp_ID_pos, Color_group) %>%
+  dplyr::mutate(Threshold = min(Contrast)) %>%
+  dplyr::select(-c(Responded,
+                   str_cols, 
+                   Exclude,
+                   Contrast,
+                   Color_Position,
+                   One_direction
+)) %>%
+  distinct()
+
+# --- Build table for non-responders (Responded==NA) ---------------------------
+# Keep metadata only; no Threshold yet (will be set to 8 below)
+No_res <- results_full %>%
+  dplyr::select(Strain, Exp_ID, Time_gr:Exclude) %>%
+  dplyr::filter(is.na(Responded)
+                ) %>%
+  distinct() %>%
+  dplyr::group_by(Exp_ID_pos, Color_group) %>%
+  dplyr::select(-c(Responded,
+                   str_cols, 
+                   Exclude,
+                   Contrast,
+                   Color_Position,
+                   One_direction
+)) %>%
+  distinct() 
+
+# --- Add only non-overlapping fish-color pairs to responders ------------------
+# Any fish-color pair not present in Threshold gets Threshold=8 (code for non-responder)
+to_add <- No_res %>%
+  dplyr::anti_join(Threshold, by = c("Strain_expid_pos", "Color_group")) %>%
+  dplyr::mutate(Threshold = 8)
+
+# combine
+Combined <- dplyr::bind_rows(Threshold, to_add)
+
+# Check that each fish has only one threshold for each color group
+Combined_counts <- Combined %>%
+     dplyr::group_by(Exp_ID_pos, Color_group) %>%
+     dplyr::summarise(n_groups = dplyr::n_distinct(Color_group))
+unique(Combined_counts$n_groups)
+
+# Check that each fish has all 6 color group
+Combined_counts <- Combined %>%
+     dplyr::group_by(Exp_ID_pos) %>%
+     dplyr::summarise(n_groups = dplyr::n_distinct(Color_group))
+unique(Combined_counts$n_groups)
+
+# --- Subsample up to 25 fish per strain for plotting --------------------------
+set.seed(818)
+
+Combined_sampled <- Combined %>%
+  ungroup() %>%
+  dplyr::select(Strain, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  sample_n(size = min(25, n()), replace = FALSE)
+
+Path_save_csv <- paste(Save_path, "/sampled_list.csv", sep = "")
+write.csv(Combined_sampled, Path_save_csv, row.names=TRUE)
+
+filtered_Combined <- Combined %>%
+  dplyr::filter(Strain_expid_pos %in% Combined_sampled$Strain_expid_pos)
+
+# --- Sample sizes after sampling (by Strain x Exp_ID, and total per Strain) ---
+Sample_size <- filtered_Combined %>%
+  ungroup() %>%
+  dplyr::select(Strain_expid_pos, Strain, Exp_ID) %>%
+  distinct() %>%
+  dplyr::group_by(Strain, Exp_ID) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+Path_save_csv <- paste(Save_path, "/sample_size_1.csv", sep = "")
+write.csv(Sample_size, Path_save_csv, row.names=TRUE)
+
+Sample_size_total <- filtered_Combined %>%
+  ungroup() %>%
+  dplyr::select(Strain_expid_pos, Strain) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+Path_save_csv <- paste(Save_path, "/sample_size_2.csv", sep = "")
+write.csv(Sample_size_total, Path_save_csv, row.names=TRUE)
+
+color_groups <- unique(Combined$Color_group)
+
+# --- Prepare luminance differences (skip "Others" for these histograms) -------
+filtered_Combined <- filtered_Combined %>%
+  dplyr::filter(!is.na(Color_group), Color_group != "Others") %>%
+  dplyr::mutate(luminosity_diff = case_when(
+    Color_group %in% c("Blue","Red","Green") & Threshold == 1 ~ 6.3,
+    Color_group %in% c("Blue","Red","Green") & Threshold == 2 ~ 12.6,
+    Color_group %in% c("Blue","Red","Green") & Threshold == 3 ~ 24.9,
+    Color_group %in% c("Blue","Red","Green") & Threshold == 4 ~ 50,
+    Color_group == "Gray_contrast" & Threshold == 1 ~ 2.8,
+    Color_group == "Gray_contrast" & Threshold == 2 ~ 5.8,
+    Color_group == "Gray_contrast" & Threshold == 3 ~ 9.0,
+    Color_group == "Gray_contrast" & Threshold == 4 ~ 20,
+    Color_group == "Gray_contrast" & Threshold == 5 ~ 40,
+    Color_group == "Gray_contrast" & Threshold == 6 ~ 70.2,
+    Color_group == "Gray_contrast" & Threshold == 7 ~ 100,
+    Threshold == 8 ~ -25,
+    TRUE ~ NA_real_
+  )) 
+
+# --- Build counts and ratios for histograms -----------------------------------
+Ratio_df <- filtered_Combined %>%
+  ungroup() %>%
+  dplyr::add_count(Strain, Color_group, name = "total") %>%                              # total per Strain x Color_group
+  dplyr::add_count(Strain, Color_group, luminosity_diff, name = "n_value") %>%           # count per Strain x Color_group x luminosity_diff
+  dplyr::mutate(ratio = 100 * n_value / total)%>%
+  ungroup()
+
+# Distinct rows for figure annotations (n, totals, ratios)
+sample_sizes <- Ratio_df %>%
+  dplyr::distinct(Strain, Color_group, luminosity_diff,
+                  total, n_value, ratio) 
+
+# --- Histogram of counts per luminance difference -----------------------------
+p <- filtered_Combined %>%
+  ggplot() +
+  geom_histogram(aes(x = luminosity_diff
+                     )
+                 , binwidth = 10) +
+  facet_grid(Strain ~ Color_group) +
+  theme_bw() +
+    geom_text(data = sample_sizes,
+            aes(x = 65, y = Inf, label = paste0("n = ", total)),
+            inherit.aes = FALSE,
+            hjust = -0.1, vjust = 1.5, size = 3)
+
+ggsave(p, path = Save_path, file = paste("histogram_count_", ".pdf", sep =""), width = 7, height = 5)
+
+# --- Ratio barplot (percent per luminance difference) -------------------------
+p <- Ratio_df %>%
+  dplyr::select(Strain, luminosity_diff, Color_group, ratio) %>%
+  distinct() %>%
+  ggplot() +
+  geom_col(aes(x = luminosity_diff, y = ratio,
+               #width = luminosity_diff,
+               #fill = luminosity_diff
+               )
+           ,width = 10
+           ) +
+  facet_grid(Strain ~ Color_group) +
+  theme_bw() +
+    # Add total n per facet
+  geom_text(data = sample_sizes,
+            aes(x = 70, y = Inf, label = paste0("n = ", total)),
+            inherit.aes = FALSE,
+            hjust = -0.1, vjust = 1.5, size = 3)
+
+ggsave(p, path = Save_path, file = paste("histogram_ratio_", ".pdf", sep =""), width = 7, height = 5)
+
+# --- Ratio barplot by Threshold index (leveled bins, 1..7; 8 for non-responders) ----
+p <- Ratio_df %>%
+  dplyr::select(Strain, Threshold, Color_group, ratio) %>%
+  distinct() %>%
+  ggplot() +
+  geom_col(aes(x = Threshold, y = ratio,
+               #width = luminosity_diff,
+               #fill = luminosity_diff
+               )
+           ) +
+  facet_grid(Strain ~ Color_group) +
+  theme_bw() +
+    # Add total n per facet
+  geom_text(data = sample_sizes,
+            aes(x = 5, y = Inf, label = paste0("n = ", total)),
+            inherit.aes = FALSE,
+            hjust = -0.1, vjust = 1.5, size = 3)
+
+ggsave(p, path = Save_path, file = paste("histogram_ratio_leveled", ".pdf", sep =""), width = 7, height = 5)
+
+# ===================================================================
+#                Color-blind combination: "Others" group
+# ===================================================================
+
+# --- Build “Others” subset and its response ratios per color pair -------------
+filtered_Combined_others <- results_full %>%
+  dplyr::filter(Color_group == "Others",
+                Strain_expid_pos %in% Combined_sampled$Strain_expid_pos) %>%
+  ungroup() %>%
+  dplyr::select(Strain, Exp_ID_pos, str_cols, Responded) %>%
+  distinct() 
+
+# Count total per Strain x str_cols, then responders only, compute % responded
+Ratio_df_others <- filtered_Combined_others %>%
+  ungroup() %>%
+  dplyr::add_count(Strain, str_cols, name = "total") %>%    # total per Strain x Color_group
+  dplyr::filter(!is.na(Responded)) %>% 
+  dplyr::add_count(Strain, str_cols, name = "n_value") %>%           # count per Strain x Color_group x luminosity_diff
+  dplyr::mutate(ratio = 100 * n_value / total) %>%
+  dplyr::select(-Exp_ID_pos) %>%
+  ungroup() %>%
+    distinct()
+
+# --- Ensure all (Strain, str_cols) pairs are present in display ---------------
+to_add <- filtered_Combined_others %>%
+  ungroup %>%
+  dplyr::select(Strain, str_cols) %>%
+  distinct()
+
+# Find missing (Strain, str_cols) combinations not in Ratio_df_others
+missing_rows <- to_add %>%
+  anti_join(Ratio_df_others, by = c("Strain", "str_cols"))
+
+# Grab default totals per strain from existing rows
+default_totals <- Ratio_df_others %>%
+  distinct(Strain, total) %>%
+  filter(!is.na(total))
+
+# Fill missing with zeros (n_value=0, ratio=0), keep totals by Strain
+missing_rows <- missing_rows %>%
+  left_join(default_totals, by = "Strain") %>%
+  mutate(
+    Responded = FALSE,
+    n_value = 0,
+    ratio = 0
+  )
+
+# Append zeros to the existing ratio table
+Ratio_df_others_updated <- bind_rows(Ratio_df_others, missing_rows)
+
+# Respect color-pair order as they appeared in the underlying data
+ordered_levels <- unique(filtered_Combined_others$str_cols)
+
+# Make sure Ratio_df_others$str_cols is a factor in that order
+Ratio_df_others_updated <- Ratio_df_others_updated %>%
+  mutate(str_cols = factor(str_cols, levels = ordered_levels))
+
+# --- Plot % responded per iso-luminant color pair -----------------------------
+p <- Ratio_df_others_updated %>%
+  ungroup() %>%
+  dplyr::select(Strain, str_cols, ratio) %>%
+  distinct() %>%
+  ggplot() +
+  geom_col(aes(x = str_cols, y = ratio,
+               #width = luminosity_diff,
+               #fill = luminosity_diff
+               )
+           ) +
+  facet_wrap(~Strain) +
+  theme_bw() +
+  # Add total n per facet (uses an x position heuristic; adjust if needed)
+  geom_text(data = default_totals,
+            aes(x = unique(Ratio_df_others$str_cols)[6], y = Inf, label = paste0("n = ", total)),
+            inherit.aes = FALSE,
+            hjust = -0.1, vjust = 1.5, size = 3) +
+#   geom_text(aes(x = str_cols, y = ratio,
+#                label = round(ratio, 2)),   # control decimals here
+#            vjust = -0.3, size = 3) +      # adjust vjust to move above bars
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(p, path = Save_path, file = paste("histogram_ratio_others_n", ".pdf", sep =""), width = 7, height = 5)
+
+# ===================================================================
+#                   Boxplots with responder summary
+# ===================================================================
+# Totals per Strain × Color_group for summary labels
+total_counts <- Ratio_df %>%
+  dplyr::distinct(Strain, Color_group, total)
+
+# Non-responder stats: rows where luminosity_diff == -25
+non_responders <- Ratio_df %>%
+  dplyr::filter(luminosity_diff == -25) %>%
+  dplyr::select(Strain, Color_group, n.nres_total = n_value, perc_nres = ratio)
+
+# Merge totals and non-responder stats; derive responder counts and label heights
+summary_df <- total_counts %>%
+  dplyr::left_join(non_responders, by = c("Strain", "Color_group")) %>%
+  dplyr::mutate(
+    n.nres_total = ifelse(is.na(n.nres_total), 0, n.nres_total),
+    perc_nres    = ifelse(is.na(perc_nres), 0, perc_nres),
+    n.res_total  = total - n.nres_total,
+    perc_res     = 100 - perc_nres,
+    height = case_when(Color_group == "Gray_contrast" ~ 130,
+                       TRUE ~ 70)
+  ) %>%
+  distinct()
+
+# For each of the first four color groups, run stats and plot boxplots
+for (group in color_groups[1:4]) {
+  
+test <- filtered_Combined %>%
+  ungroup() %>%
+  dplyr::filter(Color_group %in% group,
+                Threshold != 8) %>%
+  dplyr::select(Threshold, Strain_expid_pos, Strain, Exp_ID, luminosity_diff) %>%
+  distinct()
+
+# Sample sizes for annotations
+sample_sizes <- test %>%
+  ungroup() %>%
+  dplyr::select(Strain, Exp_ID, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(n = n())
+
+# Check Sample Size for Each Exp_ID Group
+sample_size_Exp_ID <- test %>%
+  dplyr::group_by(Strain, Exp_ID) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+# Per-strain normality (informative only)
+normal_distribution_pool <- test %>%
+  dplyr::group_by(Strain) %>%
+  shapiro_test(luminosity_diff)
+
+# Kruskal + Dunn tests
+kruskal_results <- test %>%
+  kruskal_test(luminosity_diff ~ Strain)
+
+posthoc_results_BH <- test %>%
+  dunn_test(luminosity_diff ~ Strain, p.adjust.method = "BH")
+
+posthoc_results_bonferroni <- test %>%
+  dunn_test(luminosity_diff ~ Strain, p.adjust.method = "bonferroni")
+
+# Significant comparisons only
+sig_results <- posthoc_results_bonferroni %>%
+  dplyr::filter(p.adj < 0.05)
+
+# Stack significance brackets vertically above the data range
+y_max <- max(test$luminosity_diff, na.rm = TRUE)
+sig_results <- sig_results %>%
+  dplyr::mutate(y.position = seq(y_max * 1.1, y_max * 1.1 + 0.1 * (n() - 10), length.out = n()))
+
+# === Save CSVs ===
+Name <- "/normal_distribution_pool_"
+Label <- paste(group, "luminosity_diff.csv", sep = "_")
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(normal_distribution_pool, Path_save_csv, row.names=TRUE)
+
+Name <- "/kruskal_results_"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(kruskal_results, Path_save_csv, row.names=TRUE)
+
+Name <- "/posthoc_results_BH_"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(posthoc_results_BH, Path_save_csv, row.names=TRUE)
+
+Name <- "/posthoc_results_bonferroni_"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(posthoc_results_bonferroni, Path_save_csv, row.names=TRUE)
+
+ # === Plot ===
+
+p <- test %>%
+  dplyr::group_by(Strain) %>%
+  ggplot(aes(x = Strain, y = luminosity_diff)) +
+  geom_boxplot(fill = "#B8B8B8", outlier.shape = NA) +
+  geom_beeswarm(width = 0.1, dodge.width = 0.2, 
+                size = 1, color = "black") + 
+  theme_minimal() +
+  #scale_fill_brewer(palette = "Dark2") +
+  # Add responders count and % responders per strain (top annotation)
+    geom_text(data = summary_df %>%
+                dplyr::filter(Color_group == group), 
+            aes(x = Strain, y = height,
+                label = paste0("n = ", n.res_total,
+                               "\n", round(perc_res, digits = 1),
+                                           "%")),
+            inherit.aes = FALSE,
+            size = 5,
+            vjust = 1)
+
+# Add totals and non-responder stats as a second label slightly above
+q <- p + 
+      geom_text(data = summary_df %>%
+                dplyr::filter(Color_group == group), 
+            aes(x = Strain, y = height + 15,
+                label = paste0("tn = ", total,
+                               "\n", 
+                               "nn = ", n.nres_total,
+                               "\n", 
+                               round(perc_nres, digits = 1),
+                                           "% nres")),
+            inherit.aes = FALSE,
+            size = 4,
+            vjust = 1)
+# Add significance only if there are any
+if (nrow(sig_results) > 0) {
+  p <- p + stat_pvalue_manual(
+    data = sig_results,
+    label = "p.adj.signif",
+    y.position = "y.position",
+    xmin = "group1",
+    xmax = "group2",
+    tip.length = 0.01
+  )
+}     
+
+ggsave(p, path = Save_path, file = paste("luminosity_diff_", group, ".pdf", sep =""), width = 7, height = 5)
+ggsave(q, path = Save_path, file = paste("all_luminosity_diff_", group, ".pdf", sep =""), width = 7, height = 5)
+
+}
+
+```

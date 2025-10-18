@@ -1,0 +1,1602 @@
+---
+title: "OMR analysis pipeline"
+author: "Risa Suzuki"
+date: '2025-10-14'
+output: html_document
+---
+
+# Load libraries
+This chunk loads the packages used across the pipeline. It keeps the console quiet (suppressPackageStartupMessages), loads tidy data/plotting tools (tidyverse, ggbeeswarm, ggrepel), utilities for time-series and fast I/O (zoo, data.table), color palettes (colorspace, viridis), and parallelization backends (furrr, future). It also defines a small helper operator %!in% (“not in”) used in filters.
+
+```{r Load libraries}
+# =============================
+# Load required libraries
+# =============================
+
+suppressPackageStartupMessages({
+  libs <- c(
+    "tidyverse",   
+    "gridExtra",
+    "ggbeeswarm",
+    "ggrepel",
+    "ggpubr",
+    "zoo",
+    "data.table",
+    "colorspace",
+    "viridis",
+    "furrr",
+    "future",
+    "plyr",
+    "rstatix"
+  )
+  # Load all libraries quietly
+  invisible(lapply(libs, require, character.only = TRUE))
+})
+
+# Custom infix operator: 'not in'
+`%!in%` = Negate(`%in%`)
+
+```
+
+# Set parameters
+This chunk centralizes user-editable settings: counts per experiment, naming for outputs, and recording specs (frame rate, spatial scale, arena radius). Edit them once here and the changes propagate through the analysis.
+```{r Setting parameters}
+
+# ============================================================
+#  Experimental and Analysis Parameters
+# ============================================================
+
+# Number of .tif files and total frames per experiment
+tiff_n <- 62
+camera_count <- 170000
+
+# Base name for output files
+name_selected_strain <- "medaka_zf"
+Name <- name_selected_strain
+
+# Camera setup and recording specs
+Single_camera <- FALSE   # TRUE if using a single camera
+#FPS <- 20.5              # Frames per second
+#Radius <- 50             # Radius from config.json (pixels)
+
+# Define experiment prefix
+Exp_prefix <- "RS_" # Prefix for experiment IDs (e.g., RS_001)
+```
+
+# Set source files
+This chunk sets all input/output paths: where detection files live, where time-stamp CSVs (from ImageJ Time_stamp.ijm) are stored, the metadata sheet, stripe parameters, configuration files, and the project output directory. Update these paths for your dataset; the rest of the script uses these variables.
+```{r setting paths}
+
+# ============================================================
+#                        Set File Paths
+# ============================================================
+
+# Main folder containing detection.csv files - keep only those that needs to be analyzed
+Path_folder <- "PATH/detection_folder"
+
+# Folder with time stamp .csv files (output from Time_stamp.ijm)
+Path_folder_3 <- "/PATH/time_stamp_folder"
+
+# Metadata sheet (combined experimental log)
+Path_logbook_1 <- "/PATH/metadata_sheet" 
+
+# Stripe motion parameters and timing files (e.g. 1-6_int.csv)
+Path_parameter <- "/PATH/Stripe_parameter"
+
+# Output folder to save processed data and figures
+Save_path <- "PATH/save_folder"
+```
+
+# Prepare File Name Lists
+
+This section collects all `*_detections.csv` files in the analysis folder  
+(e.g., `L_201_detections.csv`, `R_201_detections.csv`) and extracts experiment IDs.  
+Each experiment typically has one left (`L_`) and one right (`R_`) camera file that share the same numeric ID (e.g., `201`).  
+If only one side (`L` or `R`) is available, the experiment will still be included.
+
+```{r Prepare File Name Lists}
+# ============================================================
+#                 Prepare File Name Lists
+# ============================================================
+# The folder should contain files named as:
+#   L_<ExperimentID>_detections.csv
+#   R_<ExperimentID>_detections.csv
+# Example:
+#   L_201_detections.csv
+#   R_201_detections.csv
+# ============================================================
+
+# List all detection files in the folder
+file_list <- list.files(Path_folder, pattern = "_detections\\.csv$", full.names = FALSE)
+
+# Strip the suffix to get experiment base names
+Files_names_raw <- gsub("_detections\\.csv$", "", file_list)
+Files_names <- Files_names_raw
+
+# Reverse camera label for consistent ordering (e.g., L_300 → 300_L)
+Rev_Files_names <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2_\\1", Files_names)
+
+# Remove L_/R_ prefixes to get only experiment numbers
+Files <- unique(gsub("(L_)|(R_)", "", Files_names))
+
+# Generate a compact experiment range label
+File_range <- paste0(min(Files), " - ", max(Files))
+
+# Initialize vector for any experiments to be removed on error
+Remove_exp <- character(0)
+
+# Store cleaned file names for downstream use
+cleaned_files_names <- Files_names_raw
+
+```
+
+# Recalculate time 
+This section merges all time-stamp CSVs produced by *Time_stamp.ijm* for each experiment and extracts motion timing.
+
+**File naming (per experiment `RS_<id>`, e.g., `RS_305`):**
+- `RS_<id>.csv` (first stack)
+- `RS_<id>_1.csv`, `RS_<id>_2.csv`, … (subsequent stacks)
+
+**What this does:**
+1) Append all `RS_<id>_*.csv` (plus the base `RS_<id>.csv`) into one continuous table.  
+2) Create a continuous frame index (`Frame_n`) and a second-order difference (`Difference`) for extracting transition points.
+3) Identify stationary periods (`Mean < 0.8`), keep only runs ≥ 25 frames (removes brief camera-lag artifacts if any).  
+4) Use large gaps between stationary frames to mark motion start/stop edges (20 FPS: motion ≈ 3000 frames; pause ≈ 600).  
+5) Build paired `Start_f`/`End_f`, compute `Actual_frame`, and assign the expected `Duration` design.  
+6) Save `<RS_<id>>_timestamp_full.csv` and diagnostic plots (including red vertical lines at detected ends).
+```{r Recalculate time}
+
+# ============================================================
+#                 Recalculate Time from TIFF files
+# ============================================================
+# Combine per-stack timing CSVs, detect stripe motion start/stop,
+# and generate <ExpID>_timestamp_full.csv for downstream analysis.
+
+for(l in 1:length(Files)){
+  
+tryCatch({
+    # ------------------------------------------------------------
+    # Loop through each csv to combine all stack timing CSV files
+    # ------------------------------------------------------------
+# For each experiment (e.g., RS_305), this loop:
+#   1. Reads the first timestamp file (RS_305.csv)
+#   2. Iteratively loads all stack-specific timestamp files (RS_305_1.csv, RS_305_2.csv, ...)
+#   3. Appends them into one continuous time series
+#   4. Prepares a unified dataset for detecting stripe motion timing
+  
+#Add the first tiff-stack-name.csv file to Time_csv_full
+Time_dir_0 <-  paste(Path_folder_3, "/RS_", Files[l],".csv", sep = "")
+Time_csv_full <- read.csv(file = Time_dir_0)
+#Add one row that was deleted for image calculation by duplicating the last row
+Time_csv_full[nrow(Time_csv_full)+1,] <- Time_csv_full[nrow(Time_csv_full),]
+
+Time_csv_full$video <- "0"
+
+    # ------------------------------------------------------------
+    # Iterate through all stack-level .csv files for this experiment
+    # ------------------------------------------------------------
+
+for(i in 1:tiff_n){
+
+Time_dir <- paste(Path_folder_3, "/RS_", Files[l], "_", i, ".csv", sep = "")
+
+# Load .csv file 
+Time_csv <- read.csv(file = Time_dir)
+#Add one row that was deleted for image calculation by duplicating the last row
+Time_csv[nrow(Time_csv)+1,] <- Time_csv[nrow(Time_csv),]
+ # Annotate the data with the stack index
+Time_csv$video <- i
+# Append to the full time-trace for this experiment
+Time_csv_full <- rbind(Time_csv_full, Time_csv)
+
+}
+
+# ------------------------------------------------------------
+# Add frame numbering and calculate frame-to-frame differences
+# ------------------------------------------------------------
+
+# Assign a unique frame number (1, 2, 3, …) to each row
+# This creates a continuous timeline across all TIFF stacks for the experiment
+Time_csv_full <- Time_csv_full %>%
+  dplyr::mutate(Frame_n = dplyr::row_number())
+
+# The 'Mean' column in these CSVs already represents the mean gray value
+# differences between consecutive slices (frames) of the video,
+# computed by ImageJ's Time_stamp.ijm macro.
+# Here, we calculate the change between consecutive rows in that 'Mean' column —
+# effectively a *second-order difference* — to capture abrupt transitions
+# in stripe motion or stimulus onset/offset events.
+Time_csv_full$Difference <- c(NA, diff(Time_csv_full$Mean))
+
+# ------------------------------------------------------------
+# Save the combined time series for this experiment
+# ------------------------------------------------------------
+
+# Export intermediate data (with frame index and brightness difference)
+# as "<ExperimentID>_timestamp_all.csv" in the Time_stamp folder
+Path_save_time_csv <- paste(Path_folder_3, "/", Files[l], "_timestamp_all.csv", sep = "")
+write.csv(Time_csv_full, Path_save_time_csv, row.names = TRUE)
+
+# --------------------------------------------------------------------
+# Visualize mean gray-value differences across frames
+# --------------------------------------------------------------------
+# Quick check plot (subset Mean < 10) to inspect the overall profile
+# and typical ranges during stationary periods.
+
+p <- Time_csv_full %>%
+  dplyr::filter(Mean < 10) %>%
+  ggplot(aes(x = Frame_n, y = Mean)) +
+  geom_point(size = 0.01) +
+  geom_hline(yintercept = 0.8, color = "red", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = Inf, y = 0.8, label = "y = 0.8",
+         hjust = 1.1, vjust = -0.5, color = "red")
+
+# --------------------------------------------------------------------
+# Identify stationary periods
+# --------------------------------------------------------------------
+# Stationary periods are approximated by low mean gray-value differences.
+# Here we use Mean < 0.8 as the stationarity criterion.
+Filtered <- Time_csv_full %>%
+  dplyr::filter(Mean < 0.8)
+
+# ------------------------------------------------------------
+# Remove very short stationary sequences (< 25 consecutive frames)
+# ------------------------------------------------------------
+# These short stationary-like events are typically noise caused by
+# camera lag or temporary pauses during stripe motion phases.
+
+
+# Create a helper column to identify sequences 
+#   - diff: difference between consecutive frame numbers (normally 1 if continuous)
+#   - sequence_id: unique identifier for each contiguous run of stationary frames
+Filtered  <- Filtered  %>%
+   dplyr::mutate(diff = c(0, diff(Frame_n)), # gap between frames
+                 sequence_id = cumsum(diff != 1)) # increment ID when frames are non-consecutive
+
+# Group by sequence_id and count the number of frames in each stationary run
+sequence_lengths <- Filtered  %>% 
+   dplyr::group_by(sequence_id) %>% 
+   dplyr::summarize(length = n())   # number of frames per stationary segment
+
+# Keep only the stationary sequences that lasted at least 25 frames
+# Shorter stationary events are considered noise or micro-pauses
+long_sequences <- sequence_lengths %>% 
+   dplyr::filter(length >= 25)
+ 
+# Retain only frames belonging to these long stationary sequences
+# and remove helper columns that are no longer needed
+Filtered <- Filtered  %>% 
+   dplyr::filter(sequence_id %in% long_sequences$sequence_id) %>%
+   dplyr::select(-diff, -sequence_id)
+
+# --------------------------------------------------------------------
+# Plot stationary frames (Mean < 0.8) to visualize their distribution
+# Useful for visually checking the stationary threshold choice.
+r <- Filtered %>%
+  ggplot(aes(x = Frame_n, y = Mean)) +
+  geom_point(size = 0.1)
+
+# --------------------------------------------------------------------
+# Detect transitions between stationary and moving phases
+# --------------------------------------------------------------------
+# Compute gaps between consecutive stationary frames.
+# When the stripe starts moving, there will be a long gap in the indices
+# of stationary frames; when it stops, stationary frames resume.
+Filtered$Diff_frame <- c(NA, diff(Filtered$Frame_n))
+
+# Visualize the inter-frame gaps within stationary segments.
+# Large spikes in Diff_frame indicate potential start/stop transitions.
+s <- Filtered %>%
+  ggplot(aes(x = Frame_n, y = Diff_frame)) +
+  geom_point(size = 0.1)
+
+# --------------------------------------------------------------------
+# Identify candidate transition edges
+# --------------------------------------------------------------------
+# Large gaps in frame numbers (Diff_frame > 1500 at 20 FPS) indicate transitions
+# between stationary and motion phases. These correspond to frames where
+# the stripe motion started or stopped between consecutive stationary periods.
+Filtered_3000_dif <- Filtered %>%
+  dplyr::filter(Diff_frame > 1500)
+
+# --------------------------------------------------------------------
+# Refine edge selection to keep boundary frames:
+#  - keep the stationary frame right BEFORE a long motion period ends
+#    (i.e., the frame that marks END of motion → START of pause),
+#  - and the first stationary frame right AFTER a long motion period starts
+#    (i.e., the frame that marks END of pause → START of motion).
+#
+# Implementation details:
+#  - Diff_frame > 1000: strongly indicates a boundary to/from a long motion epoch (~3000 frames at 20 FPS).
+#  - Diff_frame < 20: retain near-edge stationary neighbors (small irregularities right at transitions).
+#  - second filter keeps only frames that are big-edge frames OR their immediate next stationary neighbor,
+#    so both sides of each transition are preserved.
+# --------------------------------------------------------------------
+Filtered  <- Filtered %>%
+  # Exclude those cases where there was stationary stripe during stripe motion
+  dplyr::filter(Diff_frame < 20 | Diff_frame > 1000) %>% 
+  # Filter those rows where stripe motion started/stopped and the row one next to it 
+  dplyr::filter(Frame_n %in% c(Filtered_3000_dif$Frame_n)|
+         lead(Frame_n) %in% Filtered_3000_dif$Frame_n) 
+
+# --------------------------------------------------------------------
+# Build a minimal event list around each detected transition
+# --------------------------------------------------------------------
+# Keep:
+#   - frame 1 (start of recording), and
+#   - the first stationary frame immediately AFTER each transition (+1)
+#   - plus its next frame (+2)
+# These will later be paired into Start_f / End_f events.
+Time_csv_full <- Time_csv_full %>%
+  dplyr::filter(Frame_n %in% c(1, Filtered$Frame_n+1, Filtered$Frame_n + 2))
+
+# Remove the last row (to ensure an even number of rows for Start/End pairing downstream)
+Time_csv_full <- Time_csv_full[-nrow(Time_csv_full),] 
+
+# --------------------------------------------------------------------
+# Label rows as alternating Start/End markers
+# --------------------------------------------------------------------
+# The experiment consists of 21 stripe combinations:
+#   - beginning with an initial acclimation period,
+#   - then each combination includes: pause → clockwise (CW) motion →
+#     pause → counterclockwise (CCW) motion.
+#
+# This results in a total of 42 timing events:
+#   Start_f → beginning of each motion/stationary phase (CW or CCW)
+#   End_f   → end of that motion/stationary phase
+#
+# These 42 alternating Start/End labels are applied sequentially to
+# mark all motion intervals across the entire experimental sequence.
+
+Time_point <- rep(c("Start_f", "End_f"), 42)
+Time_csv_full$Time_point <- Time_point
+
+# --------------------------------------------------------------------
+# Pair Start/End frames for each motion epoch
+# --------------------------------------------------------------------
+# Select the label ('Time_point') and its frame index, then:
+#  - group by the label so we can number rows within each label,
+#  - create an index 'row' to make pivot_wider align Start/End by row number,
+#  - pivot to wide so each row contains both Start_f and End_f.
+Time_csv_full <- Time_csv_full %>%
+  dplyr::select(Time_point, Frame_n) %>%
+  dplyr::group_by(Time_point) %>%
+  dplyr::mutate(row = row_number()) %>% # Need this to make pivot_wider work
+  tidyr::pivot_wider(names_from = Time_point,
+              values_from = Frame_n)
+
+# --------------------------------------------------------------------
+# Compute frames spent in motion/stationary for each phase
+# --------------------------------------------------------------------
+# Actual_frame = number of frames during a motion interval.
+Time_csv_full <- Time_csv_full %>%
+  dplyr::mutate(Actual_frame = End_f - Start_f)
+
+# --------------------------------------------------------------------
+# Quick diagnostic: scatter of motion duration (in frames) by epoch index
+# --------------------------------------------------------------------
+# Expected frame counts at 20 FPS (for checking consistency):
+#   - First phase ≈ 6000 frames  → 5 min acclimation (no motion)
+#   - Stripe motion phases ≈ 3000 frames → 2.5 min each motion period
+#   - Pause phases ≈ 600 frames → 30 s stationary intervals
+#
+# The plot helps visually confirm these durations — large (~3000) for motion,
+# short (~600) for pauses, and one initial long (~6000) acclimation period.
+t <- Time_csv_full %>%
+  ggplot(aes(x = row, y = Actual_frame)) +
+  geom_point(size = 0.1)
+
+ggsave(t, path = Path_folder_3, file = paste(Files[l], "_actual_frames", ".png", sep = ""))
+
+# --------------------------------------------------------------------
+# Add expected phase durations (in seconds)
+# --------------------------------------------------------------------
+# This section defines the *intended timing structure* of the experiment,
+# corresponding to the design of the stimulus),
+# not the measured durations from the video frames.
+#
+# Experiment design:
+#   - First phase: 300 s (≈ 5 min) acclimation period
+#   - Then 41 alternating cycles of:
+#       * 150 s (≈ 2.5 min) stripe motion phase
+#       *  30 s (≈ 0.5 min) stationary (pause) phase
+#   - Finally, one last 150 s motion phase
+#
+# These expected durations are used later to compare against the
+# empirically derived frame counts (Actual_frame) to verify timing accuracy.
+Duration <- c(300, rep(c(150, 30), 41),150)
+Time_csv_full$Duration <- Duration
+
+# --------------------------------------------------------------------
+# Save table for this experiment and plot with overlaid End_f markers
+# --------------------------------------------------------------------
+Path_save_time_csv <- paste(Path_folder_3, "/", Files[l],"_timestamp_full.csv", sep = "")
+write.csv(Time_csv_full, Path_save_time_csv, row.names=TRUE)
+
+# --------------------------------------------------------------------
+# Overlay detected transition points on the mean gray value trace
+# --------------------------------------------------------------------
+# The vertical red lines (End_f positions) mark the computed frame indices
+# where each stripe motion/stationary phase ended (or changed direction).
+#
+# This plot provides a direct visual check:
+#   - the red lines should align with large changes in mean gray value,
+#     confirming that the detected timing of motion transitions matches
+#     the actual stimulus behavior recorded in the video.
+u <- p + geom_vline(xintercept = Time_csv_full$End_f, color = "red")
+ggsave(u, path = Path_folder_3, file = paste(Files[l], "_Timestamps", ".png", sep = ""))
+  
+# --------------------------------------------------------------------
+# Error handling and diagnostics for failed experiments
+# --------------------------------------------------------------------
+# If any step inside the tryCatch() block fails (e.g., missing files,
+# mismatched frame counts, or malformed CSVs), the code below is executed.
+#
+#   - The experiment ID that failed (Files[l]) is added to the 'Remove_exp'
+#     vector so it can be excluded from later analyses.
+#   - The error message is printed to the console for quick debugging.
+#   - Diagnostic plots (mean gray value, frame difference, stationary intervals)
+#     are still saved to disk, allowing visual inspection of where the failure occurred.
+#
+# This ensures that a single problematic experiment does not interrupt
+# the processing of the entire batch.
+}, error = function(e) {
+  message("An error occurred: ", e$message)
+# Append this experiment ID to the exclusion list
+  Remove_exp <<- paste0(c(Remove_exp, Files[l]), collapse = "|")
+  print(e)
+
+# Save diagnostic plots to help troubleshoot failure causes
+ggsave(p, path = Path_folder_3, file = paste(Files[l], "_mean_gray_value", ".png", sep = ""))
+ggsave(s, path = Path_folder_3, file = paste(Files[l], "_Frame_diff", ".png", sep = ""))
+ggsave(r, path = Path_folder_3, file = paste(Files[l], "_mean_gray_value_less_than_1", ".png", sep = ""))
+  
+})
+
+}
+
+```
+
+# Redefine the experiment files
+This step excludes experiments that failed earlier (collected in `Remove_exp`) and rebuilds the working file lists.  
+Specifically, it:
+1) finds indices of filenames matching any pattern in `Remove_exp`,  
+2) removes those experiments from `Files_names_raw`,  
+3) rebuilds `Files_names`, `Rev_Files_names`, and the numeric `Files` list for downstream loops.  
+If `Remove_exp` is empty, nothing is changed.
+```{r Redefine the experiment files}
+
+# ============================================================
+#          Exclude failed experiments and rebuild lists
+# ============================================================
+# If 'Remove_exp' contains any experiment IDs/patterns recorded
+# during the timing step, remove them from the active file lists
+# and re-derive 'Files_names', 'Rev_Files_names', and 'Files'.
+
+if(length(Remove_exp) != 0){
+  
+# Display the experiment IDs (or patterns) flagged for removal.
+Remove_exp
+
+# Find the indices in 'Files_names_raw' that match any of the entries
+# in 'Remove_exp'. This identifies which experiment files to exclude.
+Which_to_remove <- grep(Remove_exp, Files_names_raw)
+
+# Remove the flagged experiments from the full file list.
+# This produces a cleaned list containing only successfully processed experiments.
+cleaned_files_names <- Files_names_raw[-Which_to_remove]  
+
+# Redefine the main filename list ('Files_names') to use only the cleaned set.
+Files_names <- cleaned_files_names
+
+# Reverse the order of "L_" / "R_" prefixes and numeric experiment IDs
+# (e.g., "L_203" → "203_L") for consistent downstream processing.
+Rev_Files_names <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2_\\1", Files_names)
+
+# Extract only the numeric experiment IDs from the filenames
+# (e.g., "L_203" and "R_203" both become "203").
+Files <- unique(gsub( "(L_)|(R_)","",Files_names))
+}
+
+```
+
+# Calculate lag of camera
+```{r Calculate lag of camera}
+# ============================================================
+#                 Calculating lag of camera (FPS)
+# ============================================================
+# For each experiment, compute observed FPS = (frames in motion interval) / (interval duration, s),
+# then plot FPS over cumulative experimental time to check for drift/lag.
+
+Time_csv_full <- NULL
+
+for(l in 1:length(Files)){
+
+# Read the per-experiment timing table produced earlier
+Time_dir <- paste(Path_folder_3, "/", Files[l], "_timestamp_full.csv", sep = "")
+Time_csv <- read.csv(file = Time_dir)
+
+# Compute FPS for each phase and tag with experiment ID
+#   Actual_frame: number of frames between Start_f and End_f
+Time_csv <- Time_csv %>%
+  dplyr::mutate(fps = Actual_frame/Duration,
+         Exp_n = Files[l],)
+
+# Accumulate all experiments
+Time_csv_full <- rbind(Time_csv_full, Time_csv)
+
+}
+
+# Build cumulative experimental time (in seconds) per experiment
+Time_csv_full <- Time_csv_full %>%
+  dplyr::group_by(Exp_n) %>%
+  dplyr::mutate(Time = cumsum(Duration))
+
+# --------------------------------------------------------------------
+# Plot FPS over time for each experiment
+# --------------------------------------------------------------------
+p <- Time_csv_full %>%
+  dplyr::group_by(Exp_n) %>%
+  ggplot(aes(x = Time, y = fps, color = Exp_n)) +
+  geom_smooth() +
+  geom_point() 
+  
+ggsave(p, path = Path_folder_3, file = paste("FPS", ".png", sep = ""))
+
+```
+
+# Load metadata sheet
+Modify the meta datasheet 
+  * set class of "Exp_date, Eggs_collected and Hatched" columns as "Date"
+  * add columns for "dph" and "dpf" 
+  * separate "Strain" column to "Strain", "Generation", "StockID" by "_"
+  * filter those rows with "0-49" as values for "Position" column
+```{r Load metadatasheet}
+# ============================================================
+#                    Load & Modify Metadata
+# ============================================================
+# Goal:
+#  - Load the experimental metadata sheet
+#  - Fix known entry typos
+#  - Parse date columns
+#  - Derive dpf/dph (days post fertilization / hatching)
+#  - Split Strain into Strain/Generation/StockID
+#  - Keep only wells/positions 0–49 for analysis
+
+# Load metadata sheet as .csv file; treat "" and "NA" as missing
+row_metadata <- read.csv(file = Path_logbook_1, na.strings = c("", "NA"))
+
+# ------------------------------------------------------------
+# Parse date-like columns as Date (YYYYMMDD → Date)
+# ------------------------------------------------------------
+row_metadata$Exp_date       <- as.Date(as.character(row_metadata$Exp_date),       "%Y%m%d")
+row_metadata$Eggs_collected <- as.Date(as.character(row_metadata$Eggs_collected), "%Y%m%d")
+row_metadata$Hatched        <- as.Date(as.character(row_metadata$Hatched),        "%Y%m%d")
+
+# ------------------------------------------------------------
+# Derive dpf/dph, split Strain, and filter valid positions
+# ------------------------------------------------------------
+clean_metadata <- row_metadata %>%
+ dplyr::mutate(dpf = as.numeric(difftime(row_metadata$Exp_date, row_metadata$Eggs_collected, units = "days"))) %>%
+ dplyr::mutate(dph = as.numeric(difftime(row_metadata$Exp_date, row_metadata$Hatched, units = "days"))) %>%
+  separate(Strain, c("Strain", "Generation", "StockID"), sep = "_") %>%
+  dplyr::filter(Position %in% as.character(c(0:49)))
+
+```
+
+# Check metadata for inconsistencies
+
+Quick checks on the metadata sheet:
+- Print unique values for a visual scan.
+- Flag `Exp_ID` with **dpf** outside **5–20 days** (verify `Exp_date` vs. `Eggs_collected`).
+- Flag `Exp_ID` with **dph** outside **0–20 days** (verify `Exp_date` vs. `Hatched`).
+- Optionally warn if `Eggs_collected` or `Hatched` occurs **after** `Exp_date`.
+
+```{r check metadata sheet}
+# ============================================================
+#           Quick check for metadata consistency
+# ============================================================
+
+# Show unique values for a quick visual check
+unique_data <- as.list(lapply(clean_metadata, unique))
+print(unique_data)
+
+# ---- Check ranges for dpf (5–20) and dph (0–20) ----
+bad_dpf <- clean_metadata %>%
+  dplyr::filter(!is.na(dpf) & !(dpf %in% 5:20))
+
+bad_dph <- clean_metadata %>%
+  dplyr::filter(!is.na(dph) & !(dph %in% 0:20))
+
+# ---- Print alerts if issues are found ----
+if (nrow(bad_dpf) > 0) {
+  warning(paste0("⚠️  dpf out of expected range (5–20 days): ",
+                 paste(unique(bad_dpf$Exp_ID), collapse = ", ")))
+}
+
+if (nrow(bad_dph) > 0) {
+  warning(paste0("⚠️  dph out of expected range (0–20 days): ",
+                 paste(unique(bad_dph$Exp_ID), collapse = ", ")))
+}
+
+# ---- Optional: flag impossible date orders ----
+bad_dates <- clean_metadata %>%
+  dplyr::filter(Eggs_collected > Exp_date | Hatched > Exp_date)
+
+if (nrow(bad_dates) > 0) {
+  warning(paste0("⚠️  Date inconsistency (Eggs_collected/Hatched after Exp_date): ",
+                 paste(unique(bad_dates$Exp_ID), collapse = ", ")))
+}
+
+# Print message if all looks good
+if (nrow(bad_dpf) == 0 && nrow(bad_dph) == 0 && nrow(bad_dates) == 0) {
+  message("✅ Metadata check passed — all values within expected ranges.")
+}
+```
+# Calculate response value
+	* Purpose: Loop through detection files (`<L|R>_<id>_detections.csv`) and compute per-fish response metrics.
+	* Process:
+		* Extract experiment number (`Exp_n`) and camera side (`L`/`R` or `single`).
+		* Run `calculate_response_values.Rmd` to calculate responses (`final_df_m`).
+		* Save results as `results_<Exp_n>_<L|R>.csv` in `Save_path`.
+```{r Calculate response value}
+
+# Extract just the numeric part of "<L|R>_<id>"
+Files_2 <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2", Files_names)
+
+# Loop over all detection files
+for(i in 1:length(Files_names)){
+# Path to the detection.csv for this camera side & experiment
+Path_detection_file <- paste(Path_folder, "/", Files_names[i], "_detections.csv", sep = "")
+
+# Extract experiment number and position of camera (Left or Right)
+Exp_n <- gsub("[RL_]", "", Files_names[i]) #Extract R, L or _ in the File_name[i]
+
+# Camera side label ("single" if Single_camera == TRUE)
+if (Single_camera == TRUE) {
+  L_R <- "single"}
+else {
+L_R <- str_sub(Files_names[i], 1,1)} # 'L' or 'R'
+
+# Numeric experiment id
+File_n <- Files_2[i] 
+
+# ------------------------------------------------------------
+# Run the analysis notebook that computes response metrics
+# ------------------------------------------------------------
+rmarkdown::render("calculate_response_values.Rmd")
+
+# ------------------------------------------------------------
+# Save outputs produced by the Rmd:
+#   - final_df_m   : responses per animal/well
+# ------------------------------------------------------------
+
+# Responses
+csv_name <- paste("results", Exp_n, metadata_csv_clean$L_R[1], sep = "_") 
+Path_save_csv <- paste(Save_path, "/", csv_name, ".csv", sep = "")
+write.csv(final_df_m, Path_save_csv, row.names=TRUE)
+
+}
+
+```
+
+# Rename csv files
+```{r Rename csv files}
+# ============================================================
+#            Rename files for single-camera runs
+# ============================================================
+# If Single_camera == TRUE, remove the "_single" suffix from
+# all CSV filenames in Save_path for consistency.
+if (Single_camera == TRUE){
+# Get a list of all CSV files in the folder
+csv_files <- list.files(path = Save_path, pattern = "\\.csv$", full.names = TRUE)
+
+ # Rename each by stripping "_single"
+for (file in csv_files) {
+  new_name <- gsub("_single", "", basename(file))  # Remove "_single"
+  new_path <- file.path(Save_path, new_name)  # Create the new file path
+  
+# Rename the file
+  file.rename(file, new_path)
+  
+  print(paste("Renamed:", basename(file), "→", new_name))
+}
+}
+
+```
+
+# Combinine post-analysis CSVs into full tables
+```{r Combinine post-analysis CSVs into full tables}
+
+# ============================================================
+#      Combine post-analysis CSV outputs into summaries
+# ============================================================
+# Build consolidated tables:
+#   - results_full.csv         (stack of 'results_<id>_<side>.csv')
+#   - results_speed_full.csv   (stack of 'results_speed_<id>_<side>.csv')
+# After writing each combined file, delete the corresponding
+# individual post-analysis CSVs to keep the folder tidy.
+
+# Normalize "<L|R>_<id>" → "<id>_<L|R>" for consistent filenames
+Files_names <- sub("^(L|R)_(\\d+\\.?\\d*)$", "\\2_\\1", Files_names)
+
+
+# ------------------------------------------------------------
+# Combine all results_<id>_<side>.csv files
+# ------------------------------------------------------------
+results_full<- NULL
+
+for(i in 1:length(Files_names)){
+Path_results <- paste(Save_path, "/results_", Files_names[i], ".csv", sep = "")
+result_csv <- read.csv(file = Path_results, na.strings = c("", "NA"))
+results_full <- rbind(results_full, result_csv)
+}
+
+Path_save_csv <- paste(Save_path, "/results_full.csv", sep = "")
+write.csv(results_full, Path_save_csv, row.names=TRUE)
+
+# ------------------------------------------------------------
+# Delete the individual results_<id>_<L|R>.csv files
+# ------------------------------------------------------------
+Path_results_files <- NULL
+for(i in 1:length(Files_names)){
+Path_results <- paste(Save_path, "/results_", Files_names[i], ".csv", sep = "")
+Path_results_files <- c(Path_results_files , Path_results)
+}
+
+# Check if Path_save_csv exists
+if (file.exists(Path_save_csv)) {
+file.remove(Path_results_files)
+} else {
+  cat("Path_save_csv does not exist, no files will be deleted.\n")
+}
+
+```
+
+
+# Load results_full
+```{r Load results_full}
+
+# Load combined .csv file 
+Path_save_csv <- paste(Save_path, "/results_full.csv", sep = "")
+results_full <- read.csv(file = Path_save_csv, na.strings = c("", "NA"))
+
+```
+
+
+# Exclude samples with low detection rate
+```{r}
+
+results_full <- results_full %>%
+  dplyr::filter(Det_rate > 75)
+
+```
+
+
+# Select strains for analysis
+  * Clean up the `Strain` column in both `results_full`:
+    - Remove any suffix after `@` (e.g., email-like tags or metadata).
+    - Remove any text after `)` to keep only the strain identifier.
+  * Extract the list of unique strain names to identify which strains are available for plotting.
+  * Define `Exclude_fish` — a list of known problematic or invalid entries (e.g., non-centered obstacle, mixed or multiple fish cases).
+  * Exclude these unwanted strains from the final list.
+  * The resulting vector `selected_strain` contains only valid strains used.
+```{r Select strains for analysis}
+# ============================================================
+#                Select strains for analysis
+# ============================================================
+
+# Clean up strain names by removing extra annotations:
+# - Remove any text after "@" (e.g., "HdrR@meta" → "HdrR")
+# - Remove text after ")/" to handle crossed strains with appended info
+results_full$Strain <- sub("@.*", "", results_full$Strain)
+results_full$Strain <- sub(")/.*", ")", results_full$Strain)
+
+# Get unique strain names from dataset
+selected_strain <- unique(results_full$Strain)
+
+```
+
+# Group by the time of starting of experiment
+  * Filter out rows without detection rate (`Det_rate`) to clean the dataset.  
+  * Extract the first two characters of `Record_start` to capture only the experiment’s starting hour.  
+  * Create a new column `Time_gr` that groups experiments by start time (e.g., `09:00–10:59`, `11:00–12:59`, etc.).  
+  * Add a new identifier `st_dph` combining `Strain` and `dph` (days post-hatch).  
+  * Generate a unique experiment–dish ID (`Exp_ID_pos`) by combining `Exp_ID` and `Position`.  
+  * Create additional descriptive columns:
+    - `pos_st_dph`: combines `Position`, `Strain`, and `dph` for faceting plots.  
+    - `str_width_sp`: marks each stripe width and its corresponding speed condition (normal or “_faster”).  
+    - `Strain_expid_pos`: a unique identifier combining `Strain` and experiment position.  
+  * Set the factor levels of `str_width_sp` to preserve the correct order when plotting (e.g., for y-axis alignment).
+
+```{r Group by the time of starting of experiment}
+
+# ============================================================
+#        Group by experiment start time and add metadata
+# ============================================================
+
+# Remove rows without detection rate data
+results_full  <- results_full %>%
+  dplyr::filter(!is.na(Det_rate)) 
+
+# Extract hour information from "Record_start"
+# (Keep only the first two characters to group by hour)
+results_full$Record_start <- str_sub(results_full$Record_start, 1, 2) 
+
+# Create time-group labels (e.g., "09:00–10:59") based on start time
+# Also add:
+#   - st_dph: combined Strain and developmental stage (e.g., "HdrR_5dph")
+#   - Exp_ID_pos: combined experiment ID and position
+results_full <- results_full %>%
+ dplyr::mutate(
+   Time_gr = case_when(
+   Record_start %in% c("9:", "10") ~ "09:00-10:59", 
+   Record_start %in% c("11", "12") ~ "11:00-12:59",
+   Record_start %in% c("13", "14") ~ "13:00-14:59",
+   Record_start %in% c("17", "18") ~ "17:00-18:59",
+   Record_start %in% c("15", "16") ~ "15:00-16:59",
+   Record_start %in% c("19", "20", "21") ~ "19:00-21:59"),
+   st_dph = paste(Strain, dph, "dph", sep = "_"),
+   Exp_ID_pos = paste(Exp_ID, Position, sep = "_") ###
+  )
+
+# Add composite IDs and categorical labels for downstream analysis
+# - pos_st_dph: Position + Strain + dph (for faceting)
+# - str_width_sp: Stripe width + speed category (to preserve order)
+# - Strain_expid_pos: unique key combining strain and experiment-position
+results_full <- results_full %>%
+ dplyr::filter(Strain %!in% c(NaN, NA)) %>%
+  dplyr::mutate(
+    pos_st_dph = paste(Position, Strain, dph, "dph", sep = "_"),
+    str_width_sp = case_when(
+      abs(Speed_deg.s) == 61.88 ~ paste(Stripe_width, "_faster", sep = ""),
+      abs(Speed_deg.s) == 20.63 ~ as.character(Stripe_width),
+      abs(Speed_deg.s) == 41.26 ~ as.character(Stripe_width)
+    ),
+    Strain_expid_pos = paste(Strain, Exp_ID_pos, sep = "_")
+  ) ###
+
+# Reorder stripe-width factor levels so they appear consistently in plots
+str_width_sp_pos <- unique(results_full$str_width_sp)
+results_full$str_width_sp <- factor(results_full$str_width_sp, levels = str_width_sp_pos)
+
+```
+
+# Threshold calculation
+* Filter to selected strains and construct phase identifiers:
+  - `str_width_dir = paste(Stripe_width, Direction, Speed_deg.s, sep = "_")`
+  - Within each (`Strain_expid_pos`, `str_width_dir`) group, add:
+    - `phase_n` (sequential phase index),
+    - `str_width_dir_n` (phase label),
+    - `str_abssp = paste(Stripe_width, abs(Speed_deg.s), sep = "_")`.
+* Build **`Threshold`** by summarising per fish × width×direction×speed:
+  - For each (`Exp_ID`, `Position`, `str_width_dir`) compute counts:
+    - `count_pass_p`: frames with `Response_value ≥ +0.5` (swimming with stripe),
+    - `count_pass_n`: frames with `Response_value ≤ –0.5` (swimming against stripe),
+    - `count_paused`: frames with `–0.3 < Response_value < +0.3`. (not swimming)
+  - Keep helper IDs: `Strain_expid_pos`, `str_abssp`.
+* Determine per-condition flags at the (`Exp_ID_pos`, `str_abssp`) level:
+  - `Responded = TRUE` if **both** CW and CCW exceed 15 counts in the **same sign** (either positive or negative).
+  - Note: Each stripe-motion phase lasts **2.5 min (150 s)**, with response values every **5 s** → **30 bins per phase**. A fish is considered **responsive** if it shows consistent movement (with or against the stripe) in **≥15 of 30 bins** for both directions (CW and CCW).  
+  - `One_direction = TRUE` if CW (positive) and CCW (negative) each exceed 20 counts (unidirectional tendency across directions).
+* Join flags back to `results_full`.
+* Compute **thinnest responding stripe** per fish (`Exp_ID_pos`):
+  - `Threshold_SF`: `Thinnest_st_wid = min(Stripe_width)` among phases with `Responded = TRUE`.
+  - `Threshold_SF_full`: keep the **responded stripe width** per phase as `Responded_st_wid`.
+* Join `Thinnest_st_wid` and `Responded_st_wid` back into `results_full` for downstream analyses.
+
+```{r Threshold calculation}
+
+# ============================================================
+#                    Threshold calculation
+# ============================================================
+# Goal:
+# - Build per-phase identifiers (width × direction × speed), then
+# - Count per-bin responses (≥ +0.5, ≤ −0.5, paused), then
+# - Flag phases as Responded / One_direction using bin-count thresholds,
+# - Derive thinnest responding stripe per fish, and join back.
+
+results_full <- results_full %>%
+  # Keep only selected strains for plotting/analysis
+  dplyr::filter(Strain %in% selected_strain) %>%
+  # Build condition label "stripe_width_direction_speed"
+  dplyr::mutate(str_width_dir = paste(Stripe_width, Direction, Speed_deg.s, sep = "_")) %>%
+  # Phase-wise grouping: per fish-position × condition
+  dplyr::group_by(Strain_expid_pos, str_width_dir) %>%
+  # Add phase index, a phase label including index, and absolute-speed key
+  dplyr::mutate(
+    phase_n = row_number(),
+    str_width_dir_n = paste(str_width_dir, phase_n, sep = "_"),
+    str_abssp = paste(Stripe_width, abs(Speed_deg.s), sep ="_")) %>%
+  distinct() 
+
+# ------------------------------------------------------------
+# Build per-phase counts:
+#  - count_pass_p : bins with Response_value ≥ +0.5 (with stripe)
+#  - count_pass_n : bins with Response_value ≤ −0.5 (against stripe)
+#  - count_paused : bins with −0.3 < Response_value < +0.3 (paused)
+# Add helper IDs for later joins.
+# ------------------------------------------------------------
+
+Threshold <- results_full %>%
+  ungroup() %>%
+  dplyr::select(Direction:Speed_deg.s, End_s, 
+                Position:StockID, Exp_ID:Stripe_parameter,
+                Dish:str_width_sp, Exp_ID_pos, str_width_dir) %>%
+  dplyr::group_by(Exp_ID, Position, str_width_dir) %>%
+  dplyr::mutate(
+    count_pass_p = sum(Response_value >= 0.5, na.rm = TRUE),
+    count_pass_n = sum(Response_value <= -0.5, na.rm = TRUE),
+    count_paused = sum(Response_value < 0.3 & Response_value > -0.3, na.rm = TRUE),
+    Strain_expid_pos = paste(Strain, Exp_ID, Position, sep ="_"),
+    str_abssp = paste(Stripe_width, abs(Speed_deg.s), sep ="_")
+  )
+
+# ------------------------------------------------------------
+# Flag responsiveness at the (fish-position, width×|speed|) level:
+#  - Responded = TRUE if BOTH CW and CCW exceed 15 bins with the SAME sign
+#    (≥15/30 indicates "more than half of the phase")
+#  - One_direction = TRUE if strong uni-directional bias across directions (>20 bins)
+# ------------------------------------------------------------
+Threshold <- Threshold %>%
+  distinct() %>%
+  ungroup() %>%
+  dplyr::group_by(Exp_ID_pos, str_abssp) %>%
+  dplyr::reframe(
+    Responded = if_else(
+      (!is.na(count_pass_p[Direction == "CW"]) & count_pass_p[Direction == "CW"] > 15 &
+       !is.na(count_pass_p[Direction == "CCW"]) & count_pass_p[Direction == "CCW"] > 15 ) |
+      (!is.na(count_pass_n[Direction == "CW"]) & count_pass_n[Direction == "CW"] > 15 &
+       !is.na(count_pass_n[Direction == "CCW"]) & count_pass_n[Direction == "CCW"] > 15 ),
+      first(str_abssp, na.rm = TRUE), 
+      factor(NA, levels = levels(str_abssp))),
+    One_direction = if_else(
+      (!is.na(count_pass_p[Direction == "CW"]) & count_pass_p[Direction == "CW"] > 20 &
+       !is.na(count_pass_n[Direction == "CCW"]) & count_pass_n[Direction == "CCW"] > 20) |
+      (!is.na(count_pass_n[Direction == "CW"]) & count_pass_n[Direction == "CW"] > 20 &
+       !is.na(count_pass_p[Direction == "CCW"]) & count_pass_p[Direction == "CCW"] > 20),
+      first(str_abssp, na.rm = TRUE), 
+      factor(NA, levels = levels(str_abssp))
+  )) %>%
+  distinct()
+
+# Collapse the factor columns into logical flags (TRUE if not NA)
+Threshold <- Threshold %>%
+  dplyr::mutate(One_direction = if_else(!is.na(One_direction), TRUE, NA)) %>%
+    dplyr::mutate(Responded = if_else(!is.na(Responded), TRUE, NA)) 
+
+# Join flags back to the main table
+results_full <- results_full %>%
+  distinct() %>%
+  full_join(Threshold) 
+
+# ------------------------------------------------------------
+# Per fish-position, find the thinnest stripe width that still elicited a response
+# (among phases with Responded == TRUE)
+# ------------------------------------------------------------
+Threshold_SF <- results_full %>%
+  ungroup()%>%
+  dplyr::select(Strain, Exp_ID_pos, Responded, Stripe_width) %>%
+  dplyr::filter(!is.na(Responded)
+                ) %>%
+  distinct() %>%
+  dplyr::group_by(Exp_ID_pos) %>%
+  dplyr::summarise(Thinnest_st_wid = min(Stripe_width)) %>%
+  distinct()
+
+# Attach the thinnest responding stripe width
+results_full <- results_full %>%
+  full_join(Threshold_SF)
+
+# ------------------------------------------------------------
+# Keep, per fish-position, all stripe widths at which the fish responded
+# (for later summaries/VA plots)
+# ------------------------------------------------------------
+Threshold_SF_full <- results_full %>%
+  ungroup() %>%
+  dplyr::select(Strain, Exp_ID_pos, Responded, Stripe_width) %>%
+  dplyr::filter(!is.na(Responded)
+                ) %>%
+  distinct() %>%
+  dplyr::group_by(Exp_ID_pos) %>%
+  dplyr::mutate(Responded_st_wid = Stripe_width) %>%
+  distinct()
+
+# Attach responded stripe widths
+results_full <- results_full %>%
+  full_join(Threshold_SF_full)
+
+```
+
+# Sample size calculation
+   * calculate total number of fish per strain (`total_n`)
+     - group by `Strain` and count unique `Exp_ID_pos`
+     - create label `Strain_n` formatted as `"Strain (n = X)"`
+   * calculate total number of non-responding fish per strain (`total_n_nres`)
+     - exclude fish listed in `Threshold_SF$Exp_ID_pos`
+     - group by `Strain` and count unique `Exp_ID_pos`
+     - create label `Strain_n_nres` formatted as `"Strain (n = X)"`
+   * join both summaries back into `results_full` for downstream plotting and summary statistics
+
+```{r, Sample size calculation}
+
+# ------------------------------------------------------------
+# Add total N per strain and annotated label (Strain_n = "Strain (n = X)")
+# ------------------------------------------------------------
+Total_n <- results_full %>%
+  ungroup() %>%
+  dplyr::select(Strain, Exp_ID_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(total_n = n())
+
+results_full <- results_full %>%
+  left_join(Total_n) %>%
+             dplyr::mutate(Strain_n = paste(Strain, " (n = ", 
+                                    total_n, ")", sep = ""))
+
+# ------------------------------------------------------------
+# Add total non-response N per strain and annotated label (Strain_n = "Strain (n = X)")
+# ------------------------------------------------------------
+Total_n_nres <- results_full %>%
+  ungroup() %>%
+  dplyr::select(Strain, Exp_ID_pos) %>%
+  dplyr::filter(Exp_ID_pos %!in% Threshold_SF$Exp_ID_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(total_n_nres = n()) %>%
+  dplyr::mutate(Strain_n_nres = paste(Strain, " (n = ", 
+                                    total_n_nres, ")", sep = ""))
+
+```
+
+# Summaries & Exports
+   * build mapping table `Exp_info` linking `Exp_ID_pos` to `Strain_expid_pos` for aggregation
+   * count per-fish number of phases with:
+     - `One_direction == TRUE` → `One_direction_count`
+     - `Responded == TRUE` → `Responded_count`
+   * merge these counts into `Threshold_SF` together with:
+     - `Exp_info` (experiment identifiers)
+     - `Total_n` (total number of fish per strain)
+     - `Total_n_nres` (number of responding fish per strain)
+   * replace missing count values with 0 using `replace_na()`
+   * save the summary tables as:
+     - `Stripe_width_threshold.csv` (per-fish stripe-width thresholds and counts)
+     - `results_full_thr.csv` (complete per-bin results with strain-level totals)
+```{r}
+# ============================================================
+#                Summarize
+# ============================================================
+# - Compute per-fish counts of One-direction and Responded phases
+# - Save cleaned outputs to disk
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Build per-fish counts of One-direction and Responded phases
+# ------------------------------------------------------------
+
+# Map (Exp_ID_pos -> Strain_expid_pos) so we can aggregate counts per fish
+Exp_info <- results_full %>%
+  ungroup() %>%
+  dplyr::select(Exp_ID,Exp_ID_pos, Strain_expid_pos, Strain) %>%
+  distinct()
+
+# Count how many phases were flagged One_direction per fish
+One_direction_times <- Threshold %>%
+  dplyr::filter(One_direction == TRUE) %>%
+  dplyr::group_by(Exp_ID_pos) %>%
+  dplyr::mutate(One_direction_count = n()) %>%
+  dplyr::select(Exp_ID_pos, One_direction_count) %>%
+  distinct() %>%
+  left_join(Exp_info) %>% 
+  ungroup() %>%
+  dplyr::select(-Exp_ID_pos) %>%
+  distinct()
+
+# Count how many phases were flagged Responded per fish
+Responded_times <- Threshold %>%
+  dplyr::filter(Responded == TRUE) %>%
+  dplyr::group_by(Exp_ID_pos) %>%
+  dplyr::mutate(Responded_count = n()) %>%
+  dplyr::select(Exp_ID_pos, Responded_count) %>%
+  distinct() %>%
+  left_join(Exp_info) %>% 
+  ungroup() %>%
+  dplyr::select(-Exp_ID_pos) %>%
+  distinct()
+
+# ------------------------------------------------------------
+# Merge counts into VA (fill NAs with zeros) and save outputs
+# ------------------------------------------------------------
+Threshold_SF <- Threshold_SF %>% 
+  full_join(Exp_info) %>%
+  full_join(Total_n) %>%
+  full_join(Total_n_nres) %>%
+  left_join(One_direction_times) %>%
+  dplyr::mutate(One_direction_count = replace_na(One_direction_count, 0)) %>%
+  left_join(Responded_times) %>%
+  dplyr::mutate(Responded_count = replace_na(Responded_count, 0)) 
+  
+# Save: per-fish VA table
+Path_save_csv <- paste(Save_path, "/Stripe_width_threshold.csv", sep = "")
+write.csv(Threshold_SF, Path_save_csv, row.names=TRUE)
+
+# Save: full results with VA attached
+Path_save_csv <- paste(Save_path, "/results_full_thr.csv", sep = "")
+write.csv(results_full, Path_save_csv, row.names=TRUE)
+
+```
+
+# Plot 
+```{r}
+
+# ============================================================
+#                  Plot manuscript-ver.2-20250806
+# ============================================================
+
+# -----------------------------
+# Sampling & strain selection
+# -----------------------------
+SAMPLE_n <- 25
+selected_strain <- c("AB/Beck", "HO5", "HdrR", "I2Cab", "Kaga", "QuiH2") 
+
+# Exclude a specific experiment (RS_263) from plots; keep for a later special heatmap
+# use RS_263 for cab example heatmap for comparison with eyeless
+
+results_full_exc <- results_full %>%
+  dplyr::filter(Exp_ID %!in% "RS_263")
+
+Threshold_SF_exc <- Threshold_SF %>%
+  dplyr::filter(Exp_ID %!in% "RS_263")
+
+# ============================================================
+#            Sampling subset (up to 30 per strain)
+# ============================================================
+set.seed(123)
+
+# Randomly sample up to SAMPLE_n fish per strain
+Threshold_SF_sampled <- Threshold_SF_exc %>%
+  dplyr::filter(Strain %in% selected_strain) %>%
+  dplyr::select(Strain, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  sample_n(size = min(SAMPLE_n, n()), replace = FALSE)
+
+Path_save_csv <- paste(Save_path, "/sampled_list.csv", sep = "")
+write.csv(Threshold_SF_sampled, Path_save_csv, row.names=TRUE)
+
+# Keep only sampled fish in Threshold_SF and recompute sizes
+filtered_Threshold_SF <- Threshold_SF_exc %>%
+  dplyr::filter(Strain_expid_pos %in% Threshold_SF_sampled$Strain_expid_pos)
+
+Sample_size <- filtered_Threshold_SF %>%
+  dplyr::filter(Strain %in% selected_strain) %>%
+  dplyr::select(Strain_expid_pos, Strain, Exp_ID) %>%
+  distinct() %>%
+  dplyr::group_by(Strain, Exp_ID) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+Path_save_csv <- paste(Save_path, "/sample_size_30_1.csv", sep = "")
+write.csv(Sample_size, Path_save_csv, row.names=TRUE)
+
+Sample_size_total <- filtered_Threshold_SF %>%
+  dplyr::filter(Strain %in% selected_strain) %>%
+  dplyr::select(Strain_expid_pos, Strain) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+Path_save_csv <- paste(Save_path, "/sample_size_30_2.csv", sep = "")
+write.csv(Sample_size_total, Path_save_csv, row.names=TRUE)
+
+# ------------------------------------------------------------
+# Run stats on sampled subset
+# ------------------------------------------------------------
+test <- filtered_Threshold_SF %>%
+  ungroup() %>%
+  dplyr::filter(Strain %in% selected_strain) %>%
+  dplyr::select(Thinnest_st_wid, Strain_expid_pos, Strain, Exp_ID) %>%
+  distinct()
+
+#Check Sample Size for Each Exp_ID Group
+sample_size_Exp_ID <- test %>%
+  dplyr::group_by(Strain, Exp_ID) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+#Check Normality for Each Strain Group
+normal_distribution_pool <- test %>%
+  dplyr::group_by(Strain) %>%
+  shapiro_test(Thinnest_st_wid)
+
+kruskal_results <- test %>%
+  kruskal_test(Thinnest_st_wid ~ Strain)
+
+posthoc_results_BH <- test %>%
+  dunn_test(Thinnest_st_wid ~ Strain, p.adjust.method = "BH")
+
+posthoc_results_bonferroni <- test %>%
+  dunn_test(Thinnest_st_wid ~ Strain, p.adjust.method = "bonferroni")
+
+sig_results <- posthoc_results_bonferroni %>%
+  dplyr::filter(p.adj < 0.05)
+
+y_max <- max(test$Thinnest_st_wid, na.rm = TRUE)
+sig_results <- sig_results %>%
+  dplyr::mutate(y.position = seq(y_max * 1.1, y_max * 1.1 + 0.1 * (n() - 1), length.out = n()))
+
+Name <- "/normal_distribution_pool_"
+Label <- "St_wid_Threshold_sampled.csv"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(normal_distribution_pool, Path_save_csv, row.names=TRUE)
+
+Name <- "/kruskal_results_"
+Label <- "St_wid_Threshold_sampled.csv"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(kruskal_results, Path_save_csv, row.names=TRUE)
+
+Name <- "/posthoc_results_BH_"
+Label <- "St_wid_Threshold_sampled.csv"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(posthoc_results_BH, Path_save_csv, row.names=TRUE)
+
+Name <- "/posthoc_results_bonferroni_"
+Label <- "St_wid_Threshold_sampled.csv"
+Path_save_csv <- paste(Save_path, Name, Label,sep = "")
+write.csv(posthoc_results_bonferroni, Path_save_csv, row.names=TRUE)
+
+sample_sizes <- test %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(n = n())
+
+# Totals and response rates for sampled subset
+Total_n <- filtered_Threshold_SF %>%
+  ungroup() %>%
+  dplyr::select(Strain, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(total_n = n())
+
+Total_n_res <- filtered_Threshold_SF %>%
+  dplyr::filter(Responded_count != 0) %>%
+  ungroup() %>%
+  dplyr::select(Strain, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(total_n_res = n())
+
+# Drop any old total_n/res columns before recalculating
+filtered_Threshold_SF <- filtered_Threshold_SF %>%
+  dplyr::select(-any_of(c("total_n_res", "response_rate", "total_n"  )))
+
+filtered_Threshold_SF <- filtered_Threshold_SF %>%
+  full_join(Total_n_res) %>%
+  full_join(Total_n) %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::mutate(response_rate = total_n_res/total_n)
+
+# Boxplot (sampled subset, linear scale)
+p <- test %>%
+  ungroup() %>%
+  ggplot(aes(x = Strain, y = Thinnest_st_wid)) +
+  geom_boxplot(fill = "#B8B8B8", outlier.shape = NA) +
+  geom_quasirandom(width = 0.1, dodge.width = 0.2, size = 1, color = "black") +
+  theme_bw()+
+  labs(title = "Strain vs Stripe_width") +
+  xlab("dph") +
+  ylab("Stripe width (mm)") +
+  theme(text = element_text(size = 20),
+        axis.text.x = element_text(size = 20,
+                                   angle = 45,
+                                   hjust = 1),
+        strip.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20)) +
+  guides(fill = "none")  +
+#  scale_fill_brewer(palette = "Dark2") +
+    stat_pvalue_manual(sig_results, 
+                       label = "p.adj.signif", 
+                     y.position = "y.position",
+                     xmin = "group1",
+                     xmax = "group2",
+                       tip.length = 0.01) +
+      geom_text(data =filtered_Threshold_SF %>% 
+                    dplyr::filter(Strain %in% selected_strain) %>%
+                dplyr::select(Strain, total_n_res) %>% 
+                distinct(), 
+            aes(x = Strain, y = 13, label = paste0("n=", total_n_res)),
+            inherit.aes = FALSE,
+            size = 5,
+            vjust = 1) +
+  # add label for the response rate
+    geom_text(data = filtered_Threshold_SF %>% # keep only these columns that needed
+                  dplyr::filter(Strain %in% selected_strain) %>%
+                  dplyr::select(Strain, response_rate) %>%
+                  distinct(), 
+            aes(x = Strain, y = 12, 
+                label = paste0(sprintf("%.1f", response_rate * 100), "%")), 
+            inherit.aes = FALSE,
+            size = 5,
+            vjust = 1)
+
+q <- p + stat_summary(data = test, fun = median, geom = "text", aes(label = round(..y.., 2)), vjust = -0.5) 
+
+ggsave(p, path = Save_path, file = paste("Stripe_width_Threshold_sampled", name_selected_strain, ".pdf", sep =""), width = 7, height = 5)
+
+ggsave(q, path = Save_path, file = paste("Stripe_width_Threshold_sampled_med", name_selected_strain, ".pdf", sep =""), width = 7, height = 5)
+
+# Boxplot (sampled subset, log10 y-scale)
+p <- test %>%
+  ungroup() %>%
+  ggplot(aes(x = Strain, y = Thinnest_st_wid)) +
+  geom_boxplot(fill = "#B8B8B8", outlier.shape = NA) +
+  geom_quasirandom(width = 0.1, dodge.width = 0.2, size = 1, color = "black") +
+  theme_bw()+
+  labs(title = "Strain vs Stripe_width") +
+  xlab("dph") +
+  ylab("Stripe width (mm)") +
+  theme(text = element_text(size = 20),
+        axis.text.x = element_text(size = 20,
+                                   angle = 45,
+                                   hjust = 1),
+        strip.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20)) +
+  guides(fill = "none")  +
+  scale_y_log10() +
+#  scale_fill_brewer(palette = "Dark2") +
+      geom_text(data =filtered_Threshold_SF %>% 
+                    dplyr::filter(Strain %in% selected_strain) %>%
+                dplyr::select(Strain, total_n_res) %>% 
+                distinct(), 
+            aes(x = Strain, y = 13, label = paste0("n=", total_n_res)),
+            inherit.aes = FALSE,
+            size = 5,
+            vjust = 1) +
+  # add label for the response rate
+    geom_text(data = filtered_Threshold_SF %>% # keep only these columns that needed
+                  dplyr::filter(Strain %in% selected_strain) %>%
+                  dplyr::select(Strain, response_rate) %>%
+                  distinct(), 
+            aes(x = Strain, y = 12, 
+                label = paste0(sprintf("%.1f", response_rate * 100), "%")), 
+            inherit.aes = FALSE,
+            size = 5,
+            vjust = 1)
+
+q <- p + stat_summary(data = test, fun = median, geom = "text", aes(label = round(..y.., 2)), vjust = -0.5) 
+
+ggsave(p, path = Save_path, file = paste("Stripe_width_Threshold_sampled_log_scale", name_selected_strain, ".pdf", sep =""), width = 7, height = 5)
+
+ggsave(q, path = Save_path, file = paste("Stripe_width_Threshold_sampled_log_scale_med", name_selected_strain, ".pdf", sep =""), width = 7, height = 5)
+
+# ============================================================
+#                        Heatmaps
+# ============================================================
+
+# Heatmap for sampled subset of fish (rebuild Heatmap from results_full_exc)
+
+filtered_result_full <- results_full_exc %>%
+  dplyr::filter(Strain_expid_pos %in% Threshold_SF_sampled$Strain_expid_pos)
+
+Heatmap <- filtered_result_full %>%
+#  dplyr::filter(Strain_expid_pos %in% Blind_fish) %>%
+  dplyr::mutate(str_width_dir = paste(Stripe_width, Direction, Speed_deg.s, sep = "_")) %>%
+  dplyr::group_by(Strain_expid_pos, str_width_dir) %>%
+  dplyr::mutate(phase_n = row_number(),
+                str_width_dir_n = paste(str_width_dir, phase_n, sep = "_")) %>%
+  distinct() 
+
+# Create the sequence for vertical line
+sequence <- seq(from = 1536, to = 0, by = -36)
+sequence_2 <- seq(from = 1507, to = 0, by = -36)
+
+# Create a factor variable for the custom ranges
+Heatmap$category <- cut(
+  Heatmap$Response_value, 
+  breaks = c(-Inf, -1.75,  -0.5, -0.2, 0.2, 0.5, 1.75,  Inf),
+  labels = c("black", "purple", "blue", "gray", "green", "yellow", "white"))
+
+# Define the mapping of categories to colors
+color_mapping <- c("black" = "black", "purple" = "#440154FF", "blue" = "#404688FF", "gray" = "gray", "green" = "#2AB07FFF", "yellow" = "#FDE725FF", "white" = "white")
+
+# Define how many columns does each strain have
+Col_n <- Heatmap %>%
+    dplyr::filter(Strain %in% selected_strain) %>%
+  ungroup() %>%
+  select(Strain, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::mutate(count = row_number()) %>%
+  select(Strain, count) %>%
+  slice_max(count) %>%
+  arrange(Strain) %>%
+  ungroup() %>%
+  dplyr::mutate(col_n = cumsum(count),
+                x_lab_pos = if_else(row_number() == 1, col_n[1] / 2, (col_n + lag(col_n)) / 2))
+
+
+Phase <- Heatmap %>%
+  dplyr::filter(Strain %in% selected_strain) %>%
+  ungroup() %>%
+  select(Stripe_width, str_width_dir_n) %>%
+  distinct() %>%
+  dplyr::group_by(Stripe_width) %>%
+  dplyr::mutate(count = row_number()) %>%
+  select(Stripe_width, count) %>%
+  slice_max(count) %>%
+  arrange(match(Stripe_width, rev(unique(Heatmap$Stripe_width)))) %>%
+  ungroup() %>%
+  dplyr::mutate(phase = cumsum(count)) 
+
+
+p <- Heatmap  %>%
+    dplyr::filter(Strain %in% selected_strain) %>%
+  ggplot(aes(y = reorder(str_width_dir_n, -End_s),
+             x = Strain_expid_pos, fill = category)) +
+  geom_tile() +
+  scale_fill_manual(values = color_mapping,
+                    breaks = c("black", "purple", "blue", "gray", "green", "yellow", "white"),
+                    labels = c("~ -1.75", " -1.75 ~ -0.5", "-0.5 ~ -0.2", "-0.2 ~ 0.2", "0.2 ~ 0.5", "0.5 ~ 1.75", "1.75 ~ "))  +
+  theme_minimal() +
+  labs(fill = "Value") +
+  theme(legend.position = "bottom") +
+  theme(text = element_text(size = 1),
+    axis.text.x = element_text(angle = 90, hjust =1, size = 10),
+        strip.text.x = element_text(size = 10),
+    axis.text.y=element_blank()) +
+    labs(title = "Response value",
+         fill = "Response value") +
+  ylab("") +
+    xlab("") +
+    geom_hline(yintercept = c(sequence,sequence_2),
+               color = "red") +
+   coord_cartesian(xlim = c(0, Col_n$col_n[length(Col_n$col_n)]),
+                  ylim = c(-30, length(unique(Heatmap$str_width_dir_n))))+
+    geom_vline(xintercept = Col_n$col_n + 0.5,
+               color = "blue") +
+    geom_vline(xintercept = 0,
+               color = "white",
+               size = 12) +
+    annotate("text",
+             label = Phase$Stripe_width[-length(Phase$Stripe_width)],
+    x = 0,
+    y = Phase$phase[-length(Phase$phase)] - 40,
+    size = 10,
+    colour = "black",
+    angle = 90) +
+      annotate("text",
+             label = Col_n$Strain,
+    x = Col_n$x_lab_pos,
+    y = -12,
+    size = 10,
+    colour = "black"
+    #,    angle = 90
+    )
+
+ggsave(p, path = Save_path, file = paste("Response_values_heatmap_filtered_", name_selected_strain, ".pdf", sep =""), width = 40, height = 25)
+
+# ============================================================
+#               Heatmap: eyeless vs I2Cab comparison
+# ============================================================
+
+filtered_result_full <- results_full %>%
+  dplyr::filter(str_detect(Strain, regex("eyeless", ignore_case = TRUE)) |
+    Exp_ID == "RS_262"
+  )
+
+Heatmap <- filtered_result_full %>%
+  dplyr::mutate(str_width_dir = paste(Stripe_width, Direction, Speed_deg.s, sep = "_"),
+                Strain = str_remove(Strain, "/.*")) %>%
+    dplyr::filter(Strain %in% c("eyeless", "I2Cab")) %>%
+  dplyr::group_by(Strain_expid_pos, str_width_dir) %>%
+  dplyr::mutate(phase_n = row_number(),
+                str_width_dir_n = paste(str_width_dir, phase_n, sep = "_")) %>%
+  distinct() 
+
+
+# Sample-size tables for the eyeless/Cab panel
+Sample_size <- Heatmap %>%
+  ungroup() %>%
+  dplyr::select(Strain_expid_pos, Strain, Exp_ID) %>%
+  distinct() %>%
+  dplyr::group_by(Strain, Exp_ID) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+Path_save_csv <- paste(Save_path, "/eyeless_heatmap_sample_size_1.csv", sep = "")
+write.csv(Sample_size, Path_save_csv, row.names=TRUE)
+
+Sample_size_total <- Heatmap %>%
+    ungroup() %>%
+  dplyr::select(Strain_expid_pos, Strain) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::summarise(sample_size = n(), .groups = "drop")
+
+Path_save_csv <- paste(Save_path, "/eyeless_heatmap_sample_size_2.csv", sep = "")
+write.csv(Sample_size_total, Path_save_csv, row.names=TRUE)
+
+# Create a factor variable for the custom ranges
+Heatmap$category <- cut(
+  Heatmap$Response_value, 
+  breaks = c(-Inf, -1.75,  -0.5, -0.2, 0.2, 0.5, 1.75,  Inf),
+  labels = c("black", "purple", "blue", "gray", "green", "yellow", "white"))
+
+# Define the mapping of categories to colors
+color_mapping <- c("black" = "black", "purple" = "#440154FF", "blue" = "#404688FF", "gray" = "gray", "green" = "#2AB07FFF", "yellow" = "#FDE725FF", "white" = "white")
+
+# Define how many columns does each strain have
+Col_n <- Heatmap %>%
+  ungroup() %>%
+  select(Strain, Strain_expid_pos) %>%
+  distinct() %>%
+  dplyr::group_by(Strain) %>%
+  dplyr::mutate(count = row_number()) %>%
+  select(Strain, count) %>%
+  slice_max(count) %>%
+  arrange(Strain) %>%
+  ungroup() %>%
+  dplyr::mutate(col_n = cumsum(count),
+                x_lab_pos = if_else(row_number() == 1, col_n[1] / 2, (col_n + lag(col_n)) / 2))
+
+
+Phase <- Heatmap %>%
+  ungroup() %>%
+  select(Stripe_width, str_width_dir_n) %>%
+  distinct() %>%
+  dplyr::group_by(Stripe_width) %>%
+  dplyr::mutate(count = row_number()) %>%
+  select(Stripe_width, count) %>%
+  slice_max(count) %>%
+  arrange(match(Stripe_width, rev(unique(Heatmap$Stripe_width)))) %>%
+  ungroup() %>%
+  dplyr::mutate(phase = cumsum(count)) 
+
+
+p <- Heatmap  %>%
+  ggplot(aes(y = reorder(str_width_dir_n, -End_s),
+             x = Strain_expid_pos, fill = category)) +
+  geom_tile() +
+  scale_fill_manual(values = color_mapping,
+                    breaks = c("black", "purple", "blue", "gray", "green", "yellow", "white"),
+                    labels = c("~ -1.75", " -1.75 ~ -0.5", "-0.5 ~ -0.2", "-0.2 ~ 0.2", "0.2 ~ 0.5", "0.5 ~ 1.75", "1.75 ~ "))  +
+  theme_minimal() +
+  labs(fill = "Value") +
+  theme(legend.position = "bottom") +
+  theme_minimal() +
+  theme(text = element_text(size = 1),
+    axis.text.x = element_text(angle = 90, hjust =1, size = 10),
+        strip.text.x = element_text(size = 10),
+    axis.text.y=element_blank()) +
+    labs(title = "Response value",
+         fill = "Response value") +
+  ylab("") +
+    xlab("") +
+    geom_hline(yintercept = c(sequence,sequence_2),
+#               linetype = "dotted",
+               color = "red") +
+   coord_cartesian(xlim = c(0, Col_n$col_n[length(Col_n$col_n)]),
+                  ylim = c(-30, length(unique(Heatmap$str_width_dir_n))))+
+    geom_vline(xintercept = Col_n$col_n + 0.5,
+               color = "blue") +
+    geom_vline(xintercept = 0,
+               color = "white",
+               size = 12) +
+    annotate("text",
+             label = Phase$Stripe_width[-length(Phase$Stripe_width)],
+    x = 0,
+    y = Phase$phase[-length(Phase$phase)] - 40,
+    size = 10,
+    colour = "black",
+    angle = 90) +
+      annotate("text",
+             label = Col_n$Strain,
+    x = Col_n$x_lab_pos,
+    y = -12,
+    size = 10,
+    colour = "black"
+    #,    angle = 90
+    )
+
+ggsave(p, path = Save_path, file = paste("Response_values_heatmap_eyeless_", name_selected_strain, ".pdf", sep =""), width = 10, height = 25)
+
+
+```
+

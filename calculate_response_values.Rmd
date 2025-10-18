@@ -1,0 +1,477 @@
+---
+title: "Generate result.csv file with calculated response values"
+author: "RS"
+date: "16/10/2025"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+  
+# Load metadata sheet and stripe parameter sheet
+```{r Load metadata sheet and stripe parameter sheet}
+# ============================================================
+#     Load metadata and select the stripe-parameter CSV
+# ============================================================
+# The parameter CSV must include columns like:
+# Stripe_number | Speed_rad/s | Direction | Start_s | End_s | Stripe_width | Speed_deg/s
+# Example first row:
+#   0 | 0 | P_1 | 0 | 60 | 0 | 0
+#
+# We read `clean_metadata` prepared upstream, then choose the appropriate
+# stripe-parameter file based on the experiment's `Stripe_parameter` value.
+
+#Load metadata sheet 
+metadata_csv <- clean_metadata
+
+#Choose parameter_csv file according to the 'Stripe_parameter'
+#registered for this experiment (Exp_n), using the paths you set earlier.
+
+if (unique(metadata_csv %>%
+    filter(Exp_ID %in% paste("RS", Exp_n, sep = "_")) %>%
+           select(Stripe_parameter)) %in% c("1-6", "1-9", "1-9*")){
+  parameter_csv <- read.csv(file = Path_parameter, na.strings = c("", "NA"))
+  } else if (
+    unique(metadata_csv %>%
+    filter(Exp_ID %in% paste("RS", Exp_n, sep = "_")) %>%
+           select(Stripe_parameter)) %in% "1-6*"){
+  parameter_csv <- read.csv(file = Path_parameter_1_6_2, na.strings = c("", "NA"))
+  } else if (
+    unique(metadata_csv %>%
+    filter(Exp_ID %in% paste("RS", Exp_n, sep = "_")) %>%
+           select(Stripe_parameter)) %in% "1-7"){
+  parameter_csv <- read.csv(file = Path_parameter_1_7, na.strings = c("", "NA"))
+  } else if (
+    unique(metadata_csv %>%
+    filter(Exp_ID %in% paste("RS", Exp_n, sep = "_")) %>%
+           select(Stripe_parameter)) %in% "GR1"){
+  parameter_csv <- read.csv(file = Path_parameter_GR1, na.strings = c("", "NA"))
+  } else if (
+    unique(metadata_csv %>%
+    filter(Exp_ID %in% paste("RS", Exp_n, sep = "_")) %>%
+           select(Stripe_parameter)) %in% c("CV4", "CV2", "CV")){
+  parameter_csv <- read.csv(file = Path_parameter_CVs, na.strings = c("", "NA"))
+  } else if (
+    unique(metadata_csv %>%
+    filter(Exp_ID %in% paste("RS", Exp_n, sep = "_")) %>%
+           select(Stripe_parameter)) %in% c("CvGr2")){
+  parameter_csv <- read.csv(file = Path_parameter_CvGr2, na.strings = c("", "NA"))
+  }
+
+```
+
+# Modify parameter_csv file to have rows every 5s
+```{r Modify parameter_csv file to have rows every 5s}
+
+# ============================================================
+#        Expand parameter_csv rows into 5-second slices
+# ============================================================
+# Input columns expected:
+#   Start_s, End_s  (seconds; Start_s < End_s)
+# All other columns (Speed_deg.s, Direction, etc.) are carried through.
+
+# Helper: expand one row into contiguous 5-s intervals
+expand_row_5s <- function(row) {
+  row <- as.data.frame(row, stringsAsFactors = FALSE)
+  rownames(row) <- NULL
+  start <- as.numeric(row[["Start_s"]])
+  end   <- as.numeric(row[["End_s"]])
+
+  # Keep as-is if invalid or zero/negative duration
+  if (!is.finite(start) || !is.finite(end) || end <= start) return(row)
+  dur <- end - start
+  # Normal case: split into 5-s bins; carry all non-time columns
+  if (dur >= 5) {
+    starts <- seq(from = start, to = end - 5, by = 5)
+    ends   <- pmin(starts + 5, end)   # protects against non-multiple-of-5 tails
+    base_cols <- row[, setdiff(names(row), c("Start_s", "End_s")), drop = FALSE]
+
+    out <- data.frame(
+      base_cols,
+      Start_s = starts,
+      End_s   = ends,
+      check.names = FALSE,
+      stringsAsFactors = FALSE,
+      row.names = NULL
+    )
+    return(out)
+  } else {
+    # Duration < 5 s → keep the single original interval
+    return(row)
+  }
+}
+
+
+# Apply expansion rowwise and bind back together
+parameter_csv <- do.call(
+  rbind,
+  lapply(seq_len(nrow(parameter_csv)), function(i)
+    expand_row_5s(parameter_csv[i, , drop = FALSE]))
+)
+
+rownames(parameter_csv) <- NULL
+# Keep the current column count for later indexing (used when appending response columns)
+ncol_parameter <- ncol(parameter_csv)
+```
+
+# Recalculate correct time stamp
+This step reconstructs the true experimental timeline for each frame in the video.
+Using the combined timestamp file (<experiment_id>_timestamp_full.csv) generated earlier,
+each frame (1..Cam_count) is mapped to its actual elapsed time in seconds,
+accounting for pauses and motion periods.
+The resulting table (Frame) includes:
+  * Frame — sequential frame number
+  * End_f, Actual_frame, Duration — timing information per phase
+  * seconds — seconds per frame (duration ÷ frame count)
+  * Time — cumulative elapsed time (s) from the start of recording
+```{r Recalculate correct time stamp}
+# ============================================================
+#              Recalculate correct time stamp
+# ============================================================
+# Inputs:
+#   - <Path_folder_3>/<RS_id>_timestamp_full.csv
+#       (columns: Start_f, End_f, Actual_frame, Duration, ...)
+#   - clean_metadata (to get Cam_count for this Exp_ID)
+# Output:
+#   - Frame: data.frame with per-frame seconds-per-frame and cumulative Time
+
+# Path to the combined timing table for this experiment
+Path_save_time_csv <- paste(Path_folder_3, "/", File_n,"_timestamp_full.csv", sep = "")
+# Load combined .csv file 
+Time_adj <- read.csv(file = Path_save_time_csv)
+
+# Build a complete frame index 1..Cam_count for this experiment
+Frame <- data.frame(
+  Frame = c(1:clean_metadata$Cam_count[
+    clean_metadata$Exp_ID == paste(Exp_prefix, Exp_n, sep ="")][1]))
+
+# Join: align interval info to frames by matching Frame to Start_f
+# (one row per frame; interval fields are carried forward below)
+Frame <- Frame %>%
+  full_join(Time_adj, by = c("Frame" = "Start_f"))
+
+# Carry interval fields forward (last observation carried forward)
+# so every frame inherits End_f, Actual_frame, Duration of its current interval
+Frame$End_f <- na.locf(Frame$End_f)
+Frame$Actual_frame <- na.locf(Frame$Actual_frame)
+Frame$Duration <- na.locf(Frame$Duration) 
+
+# Compute seconds per frame for the current interval and cumulative time
+Frame <- Frame %>%
+ # Add "seconds" column indicating "seconds per frame" = total seconds of the phase / number of frames in that phase
+ dplyr::mutate(seconds = Duration/Actual_frame) %>%
+ # Add "Time" column cumulative time = sum of all frame durations up to this point
+ # → effectively creates a timeline from 0 s to the end of the experiment
+ dplyr::mutate(Time = cumsum(seconds))
+
+```
+
+# Load detection.csv file,  clean & normalize detections.csv
+  * sets expected dish IDs (5×5 for dual camera; 6×5 for single camera),
+  * normalizes column names to dish numbers only,
+  * replaces the 10 FPS time with the reconstructed 20 FPS timeline (Frame$Time) when applicable,
+  * ensures all expected dish columns exist (mock if missing/degenerate),
+  * moves the time column to the far right (required by later detection-rate code).
+```{r Clean up detections.csv file}
+
+# ============================================================
+#              Load & Normalize detections.csv
+# ============================================================
+
+# Expected dish IDs:
+#   - 30 dishes (0–29) for single camera
+#   - 25 dishes (0–24) for dual camera
+
+if (Single_camera == TRUE) {
+DISH <- as.character(0:29) 
+} else {
+DISH <- as.character(0:24)} 
+
+#Load detection.csv file
+detection_df <- read.csv(
+  file = Path_detection_file,
+  na.strings = c("", "NA"))
+
+# Normalize column names:
+# "dishes.12.relative_theta" -> "12"
+names(detection_df) <- str_replace(names(detection_df), "dishes.", "")
+names(detection_df) <- str_replace(names(detection_df), ".relative_theta", "")
+
+# ------------------------------------------------------------
+# Time in detection.csv is set as 10 FPS, but the video was recorded at 20 FPS.
+# Add a column with true time.
+# ------------------------------------------------------------
+
+if (camera_count == 80000) {
+  } else {
+detection_df <- detection_df[1:camera_count,] %>%
+  dplyr::select(!time) %>%
+  dplyr::mutate(time = Frame$Time[1:camera_count])
+   } 
+
+# Trim data frame to camera_count rows
+detection_df <- detection_df[1:camera_count,]
+
+# ------------------------------------------------------------
+# Check if all expected dish columns exist.
+# If not, add mock columns for missing dishes.
+# ------------------------------------------------------------
+for (i in DISH) {
+  col_name <- as.character(i)
+  if (!(col_name %in% colnames(detection_df))) {
+    # If the column is missing, add a mock column with the same name
+    detection_df[[col_name]] <- c(rep(1, 5), rep(NA, nrow(detection_df) - 5))
+  }
+}
+
+# ------------------------------------------------------------
+# Check if each dish column has more than 2 unique values.
+# If not, replace with mock column values.
+# ------------------------------------------------------------
+for (i in DISH ) {
+col_name <- as.character(i)
+if (length(unique(detection_df[,i])) <= 2) {
+
+  # If the column contains less than 2 value, add a mock column with the same name
+    detection_df[[col_name]] <- c(rep(1, 5), rep(NA, nrow(detection_df) - 5))
+  }
+}
+
+# ------------------------------------------------------------
+# Move the "time" column to the rightmost edge.
+# ------------------------------------------------------------
+# Identify the column index of "time"
+time_col_index <- which(colnames(detection_df) == "time")
+
+# Move the "time" column to the rightmost edge
+# seq_along(df) generates 1:ncol(df)
+# setdiff() returns indices of all columns except "time"
+
+detection_df <- detection_df[, c(setdiff(seq_along(detection_df), time_col_index), time_col_index)]
+
+```
+
+# Calculate detection rate
+   * for those videos with any frames in total
+   * calculate the detection rate for each dish by counting NA in each column
+   * generate dataframe with columns of Position of dish and detection rate
+```{r Calculate detection rate}
+
+# ============================================================
+#                 Calculate detection rate
+# ============================================================
+# This section computes the detection rate (%) per dish by:
+#   1. Counting missing (NA) values per dish column
+#   2. Dividing the number of detected frames by total frame count (cam_count)
+#   3. Converting results into a long-format data.frame with:
+#        - Position : dish ID
+#        - Det_rate : detection rate (%)
+
+# 1. Extract total number of frames (cam_count) for this experiment
+cam_count <- clean_metadata$Cam_count[clean_metadata$Exp_ID == paste(Exp_prefix, Exp_n, sep = "")][1]
+
+# 2. Compute detection rate across all dish columns
+Detection_rate <- detection_df |>
+  # Remove first column ("X") and last column ("time") to isolate dish data
+  dplyr::select(-1, -time) |>
+  # Summarize each column: (cam_count - # of NAs) / cam_count * 100
+  dplyr::summarise(dplyr::across(
+    dplyr::everything(),
+    ~ (cam_count - sum(is.na(.x))) / cam_count * 100
+  )) |>
+  # Convert from wide format (1 row, many dish columns)
+  # to long format (one row per dish)
+  tidyr::pivot_longer(dplyr::everything(),
+    names_to  = "Position", # Column name for dish IDs
+    values_to = "Det_rate" # Column name for detection rate (%)
+  ) |>
+  as.data.frame() 
+```
+
+# Calculate fish position difference in angle
+  * for dish setup with 5×5 (setting DISH as vector from 0 to 24) or 6×5 for single camera
+  * loop through each dish/fish and make a list (list_1) containing a data frame with frame-wise differences in angular position
+    * extract each dish’s angle data and time, then omit NA rows (keeping only detected frames)
+    * calculate the difference in angular position between consecutive detected frames and save in column "angle_dif"
+      *  (= when fish are not detected, its position change is approximated across the missing         frames — i.e., the angular difference reflects the net change in position between the         last and next detected frames, effectively approximating the trajectory across                undetected intervals (since NA rows were omitted).)
+  * when a difference is > 300 or < –300, it’s assumed the fish crossed the circular boundary (0 ↔ 360°)
+      *  therefore, the corrected difference is calculated as
+      * angle_dif - 360 (i.e. –360 + angle_dif) when angle_dif > 300, and
+      * angle_dif + 360 (i.e. 360 + angle_dif) when angle_dif < –300,
+      * and saved in the column "angl_dif_mod"
+  * the resulting per-dish data frames (columns: "angle_dif", "Time", "angl_dif_mod") are stored in list_1[[i]]
+```{r Calculate fish position difference in angle}
+
+# ============================================================
+#     Calculate fish position difference in angle (per dish)
+# ============================================================
+
+# Set expected dish IDs (character so we can select by column name)
+if (Single_camera == TRUE) {
+DISH <- as.character(0:29) 
+} else {
+DISH <- as.character(0:24)} 
+
+# Make a list of per-dish data frames with frame-wise angle differences
+list_1 <- list()
+
+for (i in DISH) {
+  # Extract one dish column and time, omit rows with NA
+  # (creates "detection_df_dish")
+  detection_df_dish <- detection_df %>% 
+  dplyr::select(dplyr::all_of(i), time) %>%
+  na.omit()
+  
+  # Compute row-wise difference between consecutive frames
+  # (creates "detection_df_dish_dif" with columns: angle_dif, Time)
+  detection_df_dish_dif <- data.frame(diff(as.matrix(detection_df_dish))) %>%
+  dplyr::select(!time) %>%
+  dplyr::mutate(Time = detection_df_dish$time[2:nrow(detection_df_dish)]) %>%
+  setNames(c("angle_dif", "Time"))
+
+  # Modify rows where |angle_dif| > 300 to account for wrap-around at 0/360
+  detection_df_dish_dif <- detection_df_dish_dif %>%
+    dplyr::mutate(angl_dif_mod = case_when(angle_dif > 300 ~ -360 + angle_dif, 
+                                   angle_dif < -300 ~ 360 + angle_dif, 
+                                   angle_dif >=-300 ~ angle_dif,
+                                   angle_dif <= 300 ~ angle_dif))
+  # Store per-dish result in the list
+  list_1[[i]]<- as.data.frame(detection_df_dish_dif)
+}
+```
+
+# Calculate the response value
+  * This step applies only when Parameter.csv contains 7 baseline columns.
+    * Stripe_number, Speed_rad.s, Direction, Stripe_width, Speed_deg.s, Start_s, End_s
+  * If not, adjust indices accordingly in:
+    * parameter_csv[i, l + 7]
+    * as.character(DISH + 8)
+    * cols = DISH + 8
+  * Use the custom function fn() to calculate the response value for each dish and time window:
+    * Response = – (sum of fish angular displacement / sum of stripe angular displacement)
+  * Append the calculated response values (one every 5 s) as new columns to parameter.csv.
+  * Reshape the table to long format with columns "Position" (dish ID) and "Response_value",
+and save it as parameter_tidy_r for further analysis.
+```{r Calculate the response value}
+# ============================================================
+#                 Calculate the response value
+# ============================================================
+# Note:
+#   Fish angular coordinates:
+#     - 0° defined along the rightward axis of the circular arena (≈ 3 o'clock direction)
+#     - Angles increase counterclockwise (CCW); 
+#     - e.g., 180° corresponds to the 9 o'clock direction
+#   Stripe motion in parameter_csv:
+#     - Negative Speed_deg.s = CCW
+#     - Positive Speed_deg.s = CW
+#   Response values are multiplied by -1 to align conventions so that:
+#     - Positive response = fish moves in the same direction as the stripe
+
+# ------------------------------------------------------------
+# Function: compute response value for window [x, y] (seconds),
+#           for dish index z (list_1[[z]]), at row 'a' of parameter_csv.
+#           "value" = -1 * ( sum fish angular movement / sum stripe movement )
+# ------------------------------------------------------------
+
+fn <- function(x,y,z,a) {
+  # Sum of fish angular movement within [x, y]
+  fish_m <- sum(
+    list_1[[z]]$angl_dif_mod[
+    which(list_1[[z]]$Time >= x & list_1[[z]]$Time <= y)],
+    na.rm = TRUE) 
+  # Sum of stripe angular movement within [x, y]
+  if (parameter_csv$Speed_deg.s[a] != 0){ 
+    # Stripe moving
+    stripe_m <- parameter_csv$Speed_deg.s[a]*(y-x) 
+  } else if (a < 7 & parameter_csv$Speed_deg.s[a] == 0 ) { 
+    # Early stationary period (rows 1–6) → assume 20.6 deg/s
+    # e.g. acclimation time
+    stripe_m <- 20.6*(y-x) 
+  } else if (parameter_csv$Speed_deg.s[a] == 0 & parameter_csv$Speed_deg.s[a-6] != 0){
+    # Stationary right after motion → use previous motion speed (a-6)
+    # (30 s stationary period, 5 s bins → 6 bins back)
+    stripe_m <- parameter_csv$Speed_deg.s[a-6]*(y-x) 
+  } else {
+    # Stationary during acclimation or after the final motion phase
+    stripe_m <- 20.6*(y-x)
+  }
+    # Response value = - (fish motion / stripe motion)
+    value <- fish_m / stripe_m * -1 
+    return(value)}
+
+# ------------------------------------------------------------
+# Calculate response values for each row and dish, append to parameter_csv
+# ------------------------------------------------------------
+DISH <- as.numeric(DISH)
+for (l in DISH+1) {
+  for(i in c(1:nrow(parameter_csv))) {
+  parameter_csv[i,l+ncol_parameter] = fn(
+    parameter_csv$Start_s[i],
+    parameter_csv$End_s[i],
+    l,
+    i) #calculate response value of fish in dish "l" and assign in parameter_csv[i, l+ncol_parameter]
+}
+}
+
+# ------------------------------------------------------------
+# Cleanup column names and label response columns by dish ID
+# ------------------------------------------------------------
+# Remove "V" in column names (note: this removes ALL 'V' characters anywhere)
+names(parameter_csv) <- stringr::str_replace(names(parameter_csv), "V", "")
+# Rename the newly added response columns to dish numbers
+colnames(parameter_csv)[which(names(parameter_csv) %in% as.character(DISH+ncol_parameter+1))] <- DISH #response value
+
+# ------------------------------------------------------------
+# Tidy to long format: Position (dish) and Response_value
+# ------------------------------------------------------------
+parameter_tidy_r<- pivot_longer(
+  parameter_csv, 
+  cols = DISH + ncol_parameter + 1,
+  names_to = "Position",
+  values_to = "Response_value",
+  values_drop_na = FALSE)
+
+```
+
+# Combine response values, detection rates, and metadata
+  * Merge response values (parameter_tidy_r) with detection rates (Detection_rate) by dish Position.
+  * For dual-camera setups, adjust dish numbering when the video was recorded with the right-side camera to maintain unique Position identifiers:
+    * final_df$Position <- as.numeric(final_df$Position)
+    * if (L_R == "R") { final_df$Position <- final_df$Position + 25 }
+  * Extract relevant metadata for this experiment from metadata_csv, including:
+    Strain, Generation, StockID, Eggs_collected, Hatched, Exp_ID, Exp_date, Stripe_parameter, Record_start, Position, Dish, dpf, dph.
+  * Add camera information (L_R) to the metadata and merge with the combined response and detection data.
+  * The resulting table (final_df_m) contains all key experimental parameters, fish tracking metrics, and metadata for downstream analysis or visualization.
+```{r Combine dataframe}
+
+# ============================================================
+#  Combine response, detection rate, and metadata -> final_df
+# ============================================================
+
+# Combine detection rate and response value by Position
+final_df <- full_join(parameter_tidy_r, Detection_rate,  by = "Position")
+
+# Adjust Position if recorded from the right camera (2-camera setup)
+final_df$Position <- as.numeric(final_df$Position)
+if(L_R == "R"){
+  final_df$Position <- final_df$Position + 25
+} 
+
+# Select only relevant rows for this experiment from metadata
+metadata_csv_clean <- metadata_csv %>%
+  dplyr::select(
+    Strain, Generation, StockID, Eggs_collected, Hatched, Exp_ID, 
+    Exp_date, Stripe_parameter, Record_start, Position, Dish, dpf, dph) %>%
+  dplyr::filter(Exp_ID %in% paste(Exp_prefix, Exp_n, sep =""))
+
+# Ensure Position is character in both before joining
+final_df$Position <- as.character(final_df$Position)
+metadata_csv_clean$Position <- as.character(metadata_csv_clean$Position)
+
+# Add camera-side info (L/R) to metadata
+metadata_csv_clean <- metadata_csv_clean %>%
+  dplyr::mutate(L_R = L_R)
+
+# Final combined table
+final_df_m <- full_join(final_df, metadata_csv_clean,  by = "Position")
+
+```
