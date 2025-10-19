@@ -1,4 +1,4 @@
-# 🧪 OMR-analysis
+# 👀 OMR-analysis
 R, python and Fiji macro scripts for OMR experiment analysis and plotting
 
 - Prepare ROI files (manually set) for use in detection software
