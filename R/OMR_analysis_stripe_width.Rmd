@@ -1,5 +1,5 @@
 ---
-title: "OMR analysis pipeline"
+title: "OMR analysis pipeline for varying stripe width"
 author: "Risa Suzuki"
 date: '2025-10-14'
 output: html_document
