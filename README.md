@@ -37,7 +37,9 @@ OMR_analysis/
 │   ├── #combined_sheet_metadata.csv  # Sample output file from extract_metadata.py
 │   ├── L_262_detections_reduced.csv  # Example CSV file output from detect.py
 │   ├── CvGr2_int.csv             # Stripe parameters used in OMR_analysis_color_vision.Rmd
-│   └── p1-6_int.csv              # Stripe parameters used in OMR_analysis_stripe_width.Rmd
+│   ├── p1-6_int.csv              # Stripe parameters used in OMR_analysis_stripe_width.Rmd
+│   ├── Parameter 1-6             # Stripe Generator Automation Setting (Stripe width)
+│   └── Parameter CvGr2           # Stripe Generator Automation Setting (Stripe color/contrast)
 │
 └── README.md                     # Documentation and usage instructions
 ```
